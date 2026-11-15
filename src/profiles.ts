@@ -23,6 +23,21 @@ router.use((_req, res, next) => {
   res.set("Cache-Control", "no-store");
   next();
 });
+router.patch("/me", async (req, res) => {
+  const viewer = await requireUser(req);
+  const input = z.strictObject({
+    handle: handleSchema,
+    displayName: z.string().trim().min(1).max(80),
+    bio: z.string().max(2000),
+  }).partial().refine((changes) => Object.keys(changes).length > 0).safeParse(req.body);
+  if (!input.success) throw new AuthError(400, "invalid_profile");
+  const [profile] = await db.update(users)
+    .set({ ...input.data, updatedAt: new Date() })
+    .where(eq(users.id, viewer.id))
+    .returning({ handle: users.handle, displayName: users.displayName, bio: users.bio });
+  if (!profile) throw new AuthError(404, "profile_not_found");
+  res.json(profile);
+});
 router.get("/:handle", async (req, res) => {
   if (!handleSchema.safeParse(req.params.handle).success) {
     throw new AuthError(404, "profile_not_found");

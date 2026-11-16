@@ -1,0 +1,97 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1793486387731,
+      "tag": "0000_outgoing_dreadnoughts",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1793487769699,
+      "tag": "0001_short_gressill",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1793487951379,
+      "tag": "0002_remove_legacy_auth",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1793575773404,
+      "tag": "0003_silly_black_widow",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793576762224,
+      "tag": "0004_flippant_crusher_hogan",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1793983748615,
+      "tag": "0005_happy_thunderbolt_ross",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1793985531443,
+      "tag": "0006_awesome_cardiac",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1794229186484,
+      "tag": "0007_silent_rocket_raccoon",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1794383784409,
+      "tag": "0008_sturdy_gladiator",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1794384474809,
+      "tag": "0009_married_vargas",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1794384828006,
+      "tag": "0010_slow_expediter",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1794385042152,
+      "tag": "0011_panoramic_misty_knight",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1794386124046,
+      "tag": "0012_stormy_gressill",
+      "breakpoints": true
+    }
+  ]
+}

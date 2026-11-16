@@ -1,0 +1,300 @@
+import {
+  postFields,
+  postSelection,
+  serializePost,
+  reactionSelection,
+  repostSelection,
+} from "./post-data.ts";
+import { Router, type Request } from "express";
+import { and, desc, eq, isNull, lt, or, sql } from "drizzle-orm";
+import { z } from "zod";
+import { db } from "./db/index.ts";
+import { postLikes, postReposts, posts, users } from "./db/schema.ts";
+import { requireUser, readViewerId } from "./auth/request.ts";
+import { AuthError } from "./auth/provider.ts";
+
+const router = Router();
+const contentSchema = z.strictObject({
+  content: z
+    .string()
+    .trim()
+    .refine((value) => !value.includes("\u0000"))
+    .refine((value) => {
+      const length = Array.from(value).length;
+      return length > 0 && length <= 2000;
+    }),
+});
+const createSchema = contentSchema.extend({ clientId: z.uuid().optional() });
+const cursorSchema = z.strictObject({
+  createdAt: z.iso.datetime(),
+  id: z.uuid(),
+});
+async function findPost(id: string, viewerId: string | null = null) {
+  const [post] = await db
+    .select(postSelection(viewerId))
+    .from(posts)
+    .innerJoin(users, eq(users.id, posts.authorId))
+    .where(eq(posts.id, id));
+  if (!post) throw new AuthError(404, "post_not_found");
+  return serializePost(post);
+}
+async function createPost({
+  userId,
+  input,
+  parentId = null,
+}: {
+  userId: string;
+  input: z.infer<typeof createSchema>;
+  parentId?: string | null;
+}) {
+  const id = await db.transaction(async (tx) => {
+    if (parentId) {
+      const [parent] = await tx
+        .select({ id: posts.id })
+        .from(posts)
+        .where(eq(posts.id, parentId))
+        .for("key share");
+      if (!parent) throw new AuthError(404, "post_not_found");
+    }
+    const [saved] = await tx
+      .insert(posts)
+      .values({
+        id: input.clientId,
+        authorId: userId,
+        content: input.content,
+        parentId,
+      })
+      .onConflictDoNothing({ target: posts.id })
+      .returning({ id: posts.id });
+    if (saved) return saved.id;
+    if (!input.clientId) throw new Error("Post ID collision");
+    const [existing] = await tx
+      .select({
+        id: posts.id,
+        authorId: posts.authorId,
+        parentId: posts.parentId,
+        content: posts.content,
+      })
+      .from(posts)
+      .where(eq(posts.id, input.clientId));
+    if (
+      !existing ||
+      existing.authorId !== userId ||
+      existing.parentId !== parentId ||
+      existing.content !== input.content
+    )
+      throw new AuthError(409, "post_id_conflict");
+    return existing.id;
+  });
+  return findPost(id, userId);
+}
+router.use((_req, res, next) => {
+  res.set("Cache-Control", "no-store");
+  next();
+});
+const listPosts: import("express").RequestHandler = async (req, res) => {
+  const parentId =
+    typeof req.params.id === "string" ? req.params.id : undefined;
+  if (parentId) await findPost(parentId);
+  const viewerId = await readViewerId(req);
+  let cursor: z.infer<typeof cursorSchema> | undefined;
+  if (req.query.cursor !== undefined) {
+    try {
+      if (typeof req.query.cursor !== "string" || req.query.cursor.length > 512)
+        throw new Error();
+      cursor = cursorSchema.parse(
+        JSON.parse(Buffer.from(req.query.cursor, "base64url").toString("utf8")),
+      );
+    } catch {
+      throw new AuthError(400, "invalid_cursor");
+    }
+  }
+  const rows = await db
+    .select(postSelection(viewerId))
+    .from(posts)
+    .innerJoin(users, eq(users.id, posts.authorId))
+    .where(
+      and(
+        parentId ? eq(posts.parentId, parentId) : isNull(posts.parentId),
+        cursor
+          ? or(
+              lt(posts.createdAt, new Date(cursor.createdAt)),
+              and(
+                eq(posts.createdAt, new Date(cursor.createdAt)),
+                lt(posts.id, cursor.id),
+              ),
+            )
+          : undefined,
+      ),
+    )
+    .orderBy(desc(posts.createdAt), desc(posts.id))
+    .limit(21);
+  const page = rows.slice(0, 20);
+  const last = page.at(-1);
+  res.json({
+    posts: page.map(serializePost),
+    nextCursor:
+      rows.length > 20 && last
+        ? Buffer.from(
+            JSON.stringify({
+              createdAt: last.createdAt.toISOString(),
+              id: last.id,
+            }),
+          ).toString("base64url")
+        : null,
+    serverNow: new Date().toISOString(),
+  });
+};
+router.get("/", listPosts);
+router.post("/", async (req, res) => {
+  const user = await requireUser(req);
+  const parsed = createSchema.safeParse(req.body);
+  if (!parsed.success) throw new AuthError(400, "invalid_content");
+  res.status(201).json({
+    post: await createPost({ userId: user.id, input: parsed.data }),
+    serverNow: new Date().toISOString(),
+  });
+});
+router.use("/:id", (req, _res, next) => {
+  if (!z.uuid().safeParse(req.params.id).success)
+    throw new AuthError(400, "invalid_post_id");
+  next();
+});
+router.get("/:id", async (req, res) => {
+  res.json({
+    post: await findPost(req.params.id, await readViewerId(req)),
+    serverNow: new Date().toISOString(),
+  });
+});
+router.get("/:id/replies", listPosts);
+router.post("/:id/replies", async (req, res) => {
+  const user = await requireUser(req);
+  const parsed = createSchema.safeParse(req.body);
+  if (!parsed.success) throw new AuthError(400, "invalid_content");
+  res.status(201).json({
+    post: await createPost({
+      userId: user.id,
+      input: parsed.data,
+      parentId: req.params.id,
+    }),
+    serverNow: new Date().toISOString(),
+  });
+});
+async function setLike(req: Request, liked: boolean) {
+  const user = await requireUser(req);
+  const parsedId = z.uuid().safeParse(req.params.id);
+  if (!parsedId.success) throw new AuthError(400, "invalid_post_id");
+  const id = parsedId.data;
+  return db.transaction(async (tx) => {
+    // Serialize writes to this post, so retries and concurrent likes return a consistent count.
+    const [post] = await tx
+      .select({ id: posts.id })
+      .from(posts)
+      .where(eq(posts.id, id))
+      .for("update");
+    if (!post) throw new AuthError(404, "post_not_found");
+    if (liked) {
+      await tx
+        .insert(postLikes)
+        .values({ postId: id, userId: user.id })
+        .onConflictDoNothing();
+    } else {
+      await tx
+        .delete(postLikes)
+        .where(and(eq(postLikes.postId, id), eq(postLikes.userId, user.id)));
+    }
+    const [state] = await tx
+      .select(reactionSelection(user.id))
+      .from(posts)
+      .where(eq(posts.id, id));
+    return state;
+  });
+}
+router.put("/:id/like", async (req, res) => {
+  res.json(await setLike(req, true));
+});
+router.delete("/:id/like", async (req, res) => {
+  res.json(await setLike(req, false));
+});
+async function setRepost(req: Request, reposted: boolean) {
+  const user = await requireUser(req);
+  const parsedId = z.uuid().safeParse(req.params.id);
+  if (!parsedId.success) throw new AuthError(400, "invalid_post_id");
+  const id = parsedId.data;
+  return db.transaction(async (tx) => {
+    const [post] = await tx
+      .select({ id: posts.id })
+      .from(posts)
+      .where(eq(posts.id, id))
+      .for("update");
+    if (!post) throw new AuthError(404, "post_not_found");
+    if (reposted) {
+      await tx
+        .insert(postReposts)
+        .values({ postId: id, userId: user.id })
+        .onConflictDoNothing();
+    } else {
+      await tx
+        .delete(postReposts)
+        .where(
+          and(eq(postReposts.postId, id), eq(postReposts.userId, user.id)),
+        );
+    }
+    const [state] = await tx
+      .select(repostSelection(user.id))
+      .from(posts)
+      .where(eq(posts.id, id));
+    return state;
+  });
+}
+router.put("/:id/repost", async (req, res) => {
+  res.json(await setRepost(req, true));
+});
+router.delete("/:id/repost", async (req, res) => {
+  res.json(await setRepost(req, false));
+});
+router.patch("/:id", async (req, res) => {
+  const user = await requireUser(req);
+  const parsed = contentSchema.safeParse(req.body);
+  if (!parsed.success) throw new AuthError(400, "invalid_content");
+  const updated = await db.transaction(async (tx) => {
+    // Acquire the row before evaluating the clock, including waits for other writers.
+    const [existing] = await tx
+      .select({ authorId: posts.authorId })
+      .from(posts)
+      .where(eq(posts.id, req.params.id))
+      .for("update");
+    if (!existing) throw new AuthError(404, "post_not_found");
+    if (existing.authorId !== user.id)
+      throw new AuthError(403, "not_post_author");
+    const [saved] = await tx
+      .update(posts)
+      .set({ content: parsed.data.content, editedAt: sql`clock_timestamp()` })
+      .where(
+        and(
+          eq(posts.id, req.params.id),
+          sql`clock_timestamp() < ${posts.createdAt} + interval '15 minutes'`,
+        ),
+      )
+      .returning(postFields);
+    if (!saved) throw new AuthError(409, "edit_window_expired");
+    return saved;
+  });
+  res.json({
+    post: await findPost(updated.id, user.id),
+    serverNow: new Date().toISOString(),
+  });
+});
+router.delete("/:id", async (req, res) => {
+  const user = await requireUser(req);
+  const [deleted] = await db
+    .delete(posts)
+    .where(and(eq(posts.id, req.params.id), eq(posts.authorId, user.id)))
+    .returning({ id: posts.id });
+  if (!deleted) {
+    await findPost(req.params.id);
+    throw new AuthError(403, "not_post_author");
+  }
+  res.status(204).end();
+});
+export default router;

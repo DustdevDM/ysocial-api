@@ -28,7 +28,7 @@ router.patch("/me", async (req, res) => {
   const input = z.strictObject({
     handle: handleSchema,
     displayName: z.string().trim().min(1).max(80),
-    bio: z.string().max(2000),
+    bio: z.string().max(160),
   }).partial().refine((changes) => Object.keys(changes).length > 0).safeParse(req.body);
   if (!input.success) throw new AuthError(400, "invalid_profile");
   const [profile] = await db.update(users)

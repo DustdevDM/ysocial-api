@@ -38,6 +38,14 @@ router.patch("/me", async (req, res) => {
   if (!profile) throw new AuthError(404, "profile_not_found");
   res.json(profile);
 });
+router.get("/:handle/availability", async (req, res) => {
+  const handle = handleSchema.safeParse(req.params.handle);
+  if (!handle.success) throw new AuthError(400, "invalid_handle");
+  const [existing] = await db.select({ id: users.id }).from(users)
+    .where(eq(users.handle, handle.data)).limit(1);
+  const available = !existing || existing.id === await readViewerId(req);
+  res.json({ available });
+});
 router.get("/:handle", async (req, res) => {
   if (!handleSchema.safeParse(req.params.handle).success) {
     throw new AuthError(404, "profile_not_found");

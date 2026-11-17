@@ -6,12 +6,14 @@ import {
   repostSelection,
 } from "./post-data.ts";
 import { Router, type Request } from "express";
-import { and, desc, eq, isNull, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, isNull, lt, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db/index.ts";
 import { postLikes, postReposts, posts, users } from "./db/schema.ts";
 import { requireUser, readViewerId } from "./auth/request.ts";
 import { AuthError } from "./auth/provider.ts";
+import { userSelection } from "./user-data.ts";
+import { recordNotification } from "./notification-events.ts";
 
 const router = Router();
 const contentSchema = z.strictObject({
@@ -48,13 +50,15 @@ async function createPost({
   parentId?: string | null;
 }) {
   const id = await db.transaction(async (tx) => {
+    let parentAuthor: string | undefined;
     if (parentId) {
       const [parent] = await tx
-        .select({ id: posts.id })
+        .select({ id: posts.id, authorId: posts.authorId })
         .from(posts)
         .where(eq(posts.id, parentId))
         .for("key share");
       if (!parent) throw new AuthError(404, "post_not_found");
+      parentAuthor = parent.authorId;
     }
     const [saved] = await tx
       .insert(posts)
@@ -66,7 +70,17 @@ async function createPost({
       })
       .onConflictDoNothing({ target: posts.id })
       .returning({ id: posts.id });
-    if (saved) return saved.id;
+    if (saved) {
+      if (parentAuthor)
+        await recordNotification(tx, {
+          recipientId: parentAuthor,
+          actorId: userId,
+          kind: "reply",
+          postId: saved.id,
+          subject: saved.id,
+        });
+      return saved.id;
+    }
     if (!input.clientId) throw new Error("Post ID collision");
     const [existing] = await tx
       .select({
@@ -167,6 +181,34 @@ router.get("/:id", async (req, res) => {
   });
 });
 router.get("/:id/replies", listPosts);
+router.get("/:id/activity", async (req, res) => {
+  const query = z
+    .object({
+      type: z.enum(["likes", "reposts"]),
+      cursor: z.uuid().optional(),
+    })
+    .safeParse(req.query);
+  if (!query.success) throw new AuthError(400, "invalid_activity_query");
+  await findPost(req.params.id);
+  const activity = query.data.type === "likes" ? postLikes : postReposts;
+  const rows = await db
+    .select(userSelection)
+    .from(activity)
+    .innerJoin(users, eq(users.id, activity.userId))
+    .where(
+      and(
+        eq(activity.postId, req.params.id),
+        query.data.cursor ? gt(activity.userId, query.data.cursor) : undefined,
+      ),
+    )
+    .orderBy(asc(activity.userId))
+    .limit(51);
+  const page = rows.slice(0, 50);
+  res.json({
+    users: page,
+    nextCursor: rows.length > 50 ? (page.at(-1)?.id ?? null) : null,
+  });
+});
 router.post("/:id/replies", async (req, res) => {
   const user = await requireUser(req);
   const parsed = createSchema.safeParse(req.body);
@@ -188,16 +230,25 @@ async function setLike(req: Request, liked: boolean) {
   return db.transaction(async (tx) => {
     // Serialize writes to this post, so retries and concurrent likes return a consistent count.
     const [post] = await tx
-      .select({ id: posts.id })
+      .select({ id: posts.id, authorId: posts.authorId })
       .from(posts)
       .where(eq(posts.id, id))
       .for("update");
     if (!post) throw new AuthError(404, "post_not_found");
     if (liked) {
-      await tx
+      const [inserted] = await tx
         .insert(postLikes)
         .values({ postId: id, userId: user.id })
-        .onConflictDoNothing();
+        .onConflictDoNothing()
+        .returning();
+      if (inserted)
+        await recordNotification(tx, {
+          recipientId: post.authorId,
+          actorId: user.id,
+          kind: "like",
+          postId: id,
+          subject: id,
+        });
     } else {
       await tx
         .delete(postLikes)
@@ -223,16 +274,25 @@ async function setRepost(req: Request, reposted: boolean) {
   const id = parsedId.data;
   return db.transaction(async (tx) => {
     const [post] = await tx
-      .select({ id: posts.id })
+      .select({ id: posts.id, authorId: posts.authorId })
       .from(posts)
       .where(eq(posts.id, id))
       .for("update");
     if (!post) throw new AuthError(404, "post_not_found");
     if (reposted) {
-      await tx
+      const [inserted] = await tx
         .insert(postReposts)
         .values({ postId: id, userId: user.id })
-        .onConflictDoNothing();
+        .onConflictDoNothing()
+        .returning();
+      if (inserted)
+        await recordNotification(tx, {
+          recipientId: post.authorId,
+          actorId: user.id,
+          kind: "repost",
+          postId: id,
+          subject: id,
+        });
     } else {
       await tx
         .delete(postReposts)

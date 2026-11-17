@@ -6,10 +6,21 @@ import {
   repostSelection,
 } from "./post-data.ts";
 import { Router, type Request } from "express";
-import { and, asc, desc, eq, gt, isNull, lt, or, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gt,
+  inArray,
+  isNull,
+  lt,
+  or,
+  sql,
+} from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db/index.ts";
-import { postLikes, postReposts, posts, users } from "./db/schema.ts";
+import { postEdits, postLikes, postReposts, posts, users } from "./db/schema.ts";
 import { requireUser, readViewerId } from "./auth/request.ts";
 import { AuthError } from "./auth/provider.ts";
 import { userSelection } from "./user-data.ts";
@@ -180,6 +191,81 @@ router.get("/:id", async (req, res) => {
     serverNow: new Date().toISOString(),
   });
 });
+const THREAD_MAX_DEPTH = 12;
+const THREAD_MAX_REPLIES = 300;
+// Full conversation around a post: the chain above it (root first) and every
+// nested reply below it (shallowest first, then oldest first), so clients can
+// render a collapsible tree without one request per level.
+router.get("/:id/thread", async (req, res) => {
+  const id = req.params.id;
+  const viewerId = await readViewerId(req);
+  const post = await findPost(id, viewerId);
+  const [ancestorRows, descendantRows] = await Promise.all([
+    db.execute<{ id: string }>(sql`
+      with recursive chain as (
+        select id, parent_id, 0 as depth from posts where id = ${id}
+        union all
+        select p.id, p.parent_id, c.depth + 1
+        from posts p join chain c on p.id = c.parent_id
+        where c.depth < 100
+      )
+      select id from chain where depth > 0 order by depth desc
+    `),
+    db.execute<{ id: string }>(sql`
+      with recursive tree as (
+        select id, 1 as depth from posts where parent_id = ${id}
+        union all
+        select p.id, t.depth + 1
+        from posts p join tree t on p.parent_id = t.id
+        where t.depth < ${THREAD_MAX_DEPTH}
+      )
+      select t.id from tree t join posts p on p.id = t.id
+      order by t.depth, p.created_at, p.id
+      limit ${THREAD_MAX_REPLIES + 1}
+    `),
+  ]);
+  const ancestorIds = ancestorRows.rows.map((row) => row.id);
+  const truncated = descendantRows.rows.length > THREAD_MAX_REPLIES;
+  const descendantIds = descendantRows.rows
+    .slice(0, THREAD_MAX_REPLIES)
+    .map((row) => row.id);
+  const wanted = [...ancestorIds, ...descendantIds];
+  const rows = wanted.length
+    ? await db
+        .select(postSelection(viewerId))
+        .from(posts)
+        .innerJoin(users, eq(users.id, posts.authorId))
+        .where(inArray(posts.id, wanted))
+    : [];
+  const byId = new Map(rows.map((row) => [row.id, serializePost(row)]));
+  const pick = (ids: string[]) =>
+    ids.flatMap((postId) => {
+      const found = byId.get(postId);
+      return found ? [found] : [];
+    });
+  res.json({
+    post,
+    ancestors: pick(ancestorIds),
+    replies: pick(descendantIds),
+    truncated,
+    serverNow: new Date().toISOString(),
+  });
+});
+// Edit history, newest version first (the current text is the first entry).
+router.get("/:id/edits", async (req, res) => {
+  const post = await findPost(req.params.id);
+  const earlier = await db
+    .select({ content: postEdits.content, at: postEdits.versionAt })
+    .from(postEdits)
+    .where(eq(postEdits.postId, post.id))
+    .orderBy(desc(postEdits.versionAt));
+  res.json({
+    versions: [
+      { content: post.content, at: post.editedAt ?? post.createdAt },
+      ...earlier,
+    ],
+  });
+});
 router.get("/:id/replies", listPosts);
 router.get("/:id/activity", async (req, res) => {
   const query = z
@@ -320,7 +406,12 @@ router.patch("/:id", async (req, res) => {
   const updated = await db.transaction(async (tx) => {
     // Acquire the row before evaluating the clock, including waits for other writers.
     const [existing] = await tx
-      .select({ authorId: posts.authorId })
+      .select({
+        authorId: posts.authorId,
+        content: posts.content,
+        createdAt: posts.createdAt,
+        editedAt: posts.editedAt,
+      })
       .from(posts)
       .where(eq(posts.id, req.params.id))
       .for("update");
@@ -338,6 +429,12 @@ router.patch("/:id", async (req, res) => {
       )
       .returning(postFields);
     if (!saved) throw new AuthError(409, "edit_window_expired");
+    if (existing.content !== parsed.data.content)
+      await tx.insert(postEdits).values({
+        postId: req.params.id,
+        content: existing.content,
+        versionAt: existing.editedAt ?? existing.createdAt,
+      });
     return saved;
   });
   res.json({

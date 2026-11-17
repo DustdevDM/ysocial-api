@@ -43,6 +43,10 @@ app.use("/api/notifications", notifications);
 app.use("/api/profiles", profiles);
 app.use("/api/avatars", avatars);
 app.use("/api/banners", banners);
+// Unknown API routes answer in JSON like every other API error.
+app.use(["/api", "/auth"], (_req, res) => {
+  res.status(404).json({ error: "route_not_found" });
+});
 
 app.get("/", (_req, res) => {
   res.redirect("https://docs.ysocial.cc/");

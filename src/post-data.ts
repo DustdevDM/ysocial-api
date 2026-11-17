@@ -27,8 +27,35 @@ export function repostSelection(viewerId: string | null) {
         : sql<boolean>`exists(select 1 from ${postReposts} where ${postReposts.postId} = ${posts.id} and ${postReposts.userId} = ${viewerId})`,
   };
 }
+// "Friends" are mutual follows. Friends who liked a post are surfaced under it.
+const friendLikeFilter = (viewerId: string) => sql`
+  pl.post_id = ${posts.id}
+  and exists (select 1 from user_follows a where a.follower_id = ${viewerId} and a.following_id = pl.user_id)
+  and exists (select 1 from user_follows b where b.follower_id = pl.user_id and b.following_id = ${viewerId})`;
+export function friendLikeSelection(viewerId: string | null) {
+  return {
+    friendLikes:
+      viewerId === null
+        ? sql<number>`0`
+        : sql<number>`(select count(*)::int from post_likes pl where ${friendLikeFilter(viewerId)})`,
+    friendLikers:
+      viewerId === null
+        ? sql<{ id: string; handle: string; displayName: string; avatarUrl: string | null }[]>`'[]'::json`
+        : sql<{ id: string; handle: string; displayName: string; avatarUrl: string | null }[]>`(
+            select coalesce(json_agg(t), '[]'::json) from (
+              select u.id, u.handle, u.display_name as "displayName",
+                coalesce('/api/' || u.avatar_key, (select ai.picture from auth_identities ai where ai.user_id = u.id and ai.deleted_at is null)) as "avatarUrl"
+              from post_likes pl join users u on u.id = pl.user_id
+              where ${friendLikeFilter(viewerId)}
+              order by u.handle
+              limit 4
+            ) t
+          )`,
+  };
+}
 export const postSelection = (viewerId: string | null) => ({
   ...reactionSelection(viewerId),
+  ...friendLikeSelection(viewerId),
   ...repostSelection(viewerId),
   ...postFields,
   replies: sql<number>`(

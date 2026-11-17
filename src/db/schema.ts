@@ -119,6 +119,21 @@ export const posts = pgTable(
   ],
 );
 
+// Earlier versions of edited posts, saved when an edit replaces them.
+export const postEdits = pgTable(
+  "post_edits",
+  {
+    id: uuid().defaultRandom().primaryKey(),
+    postId: uuid("post_id")
+      .notNull()
+      .references(() => posts.id, { onDelete: "cascade" }),
+    content: text().notNull(),
+    // When this version was written: the post's creation or its previous edit.
+    versionAt: timestamp("version_at", { withTimezone: true, precision: 3 }).notNull(),
+  },
+  (table) => [index("post_edits_post_idx").on(table.postId, table.versionAt.desc())],
+);
+
 export const postLikes = pgTable(
   "post_likes",
   {

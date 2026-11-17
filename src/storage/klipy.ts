@@ -21,6 +21,13 @@ const rendition = z.object({
   width: z.number().positive().optional(),
   height: z.number().positive().optional(),
 });
+const gifSelectionSchema = z.object({
+  url: mediaUrl,
+  title: z.string().default("GIF"),
+  userId: z.string(),
+  expires: z.number(),
+});
+export type KlipyGif = Pick<z.infer<typeof gifSelectionSchema>, "url" | "title">;
 const itemSchema = z.object({
   slug: z.string(),
   title: z.string(),
@@ -75,9 +82,11 @@ export async function searchGifs(query: string, page: number, userId: string) {
         const thumbnail = item.file.sm.gif ?? item.file.sm.webp;
         if (!media || !thumbnail || (media.size ?? 0) > bannerUploadLimit)
           return [];
+        const title = item.title.trim().slice(0, 300) || "GIF";
         const payload = Buffer.from(
           JSON.stringify({
             url: media.url,
+            title,
             userId,
             expires: Date.now() + 30 * 60000,
           }),
@@ -85,7 +94,7 @@ export async function searchGifs(query: string, page: number, userId: string) {
         return [
           {
             id: item.slug,
-            title: item.title,
+            title,
             previewUrl: thumbnail.url,
             width: thumbnail.width,
             height: thumbnail.height,
@@ -101,22 +110,28 @@ export async function searchGifs(query: string, page: number, userId: string) {
     throw new AuthError(503, "gif_search_unavailable");
   }
 }
-export function selectedGifUrl(token: string, userId: string) {
-  const [payload, signed] = token.split(".");
-  if (!payload || !signed) throw new AuthError(400, "invalid_gif_selection");
+export function readGifSelection(token: string, userId: string) {
+  const [payload, signed, extra] = token.split(".");
+  if (!payload || !signed || extra !== undefined)
+    throw new AuthError(400, "invalid_gif_selection");
   const expected = Buffer.from(signature(payload)),
     actual = Buffer.from(signed);
   if (expected.length !== actual.length || !timingSafeEqual(expected, actual))
     throw new AuthError(400, "invalid_gif_selection");
   let data;
   try {
-    data = z
-      .object({ url: mediaUrl, userId: z.string(), expires: z.number() })
-      .parse(JSON.parse(Buffer.from(payload, "base64url").toString()));
+    data = gifSelectionSchema.parse(
+      JSON.parse(Buffer.from(payload, "base64url").toString()),
+    );
   } catch {
     throw new AuthError(400, "invalid_gif_selection");
   }
-  if (data.userId !== userId || data.expires < Date.now())
+  if (data.userId !== userId)
     throw new AuthError(400, "invalid_gif_selection");
-  return data.url;
+  return { gif: { url: data.url, title: data.title }, expires: data.expires };
+}
+export function selectedGifUrl(token: string, userId: string) {
+  const { gif, expires } = readGifSelection(token, userId);
+  if (expires < Date.now()) throw new AuthError(400, "invalid_gif_selection");
+  return gif.url;
 }

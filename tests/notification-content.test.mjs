@@ -15,3 +15,9 @@ test("long previews never cut an emoji in half", () => {
   const flags = notificationPreview(`${"a".repeat(158)}🇩🇪🇩🇪🇩🇪`);
   assert.equal(flags, `${"a".repeat(158)}🇩🇪…`);
 });
+
+test("GIF posts use their caption or a GIF fallback", () => {
+  assert.equal(notificationPreview("", true), "GIF");
+  assert.equal(notificationPreview(""), "");
+  assert.equal(notificationPreview(" 👋 ", true), "👋");
+});

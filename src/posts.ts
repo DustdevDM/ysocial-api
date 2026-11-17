@@ -35,6 +35,7 @@ import { recordNotification } from "./notification-events.ts";
 import { parseTopicName, syncPostTopics } from "./topics.ts";
 
 import { syncMentions } from "./mentions.ts";
+import { readGifSelection } from "./storage/klipy.ts";
 
 const router = Router();
 const contentSchema = z.strictObject({
@@ -44,14 +45,18 @@ const contentSchema = z.strictObject({
     .refine((value) => !value.includes("\u0000"))
     .refine((value) => {
       const length = Array.from(value).length;
-      return length > 0 && length <= 2000;
+      return length <= 2000;
     }),
 });
-const createSchema = contentSchema.extend({
-  clientId: z.uuid().optional(),
-  // Text-only web posts include this field. Uploaded attachments are not supported yet.
-  attachmentIds: z.array(z.uuid()).max(0).optional(),
-});
+const createSchema = contentSchema
+  .extend({
+    content: contentSchema.shape.content.default(""),
+    clientId: z.uuid().optional(),
+    // Preserve compatibility with callers that send an empty attachment list.
+    attachmentIds: z.array(z.uuid()).max(0).optional(),
+    gifToken: z.string().min(1).max(4096).optional(),
+  })
+  .refine(({ content, gifToken }) => Boolean(content || gifToken));
 const cursorSchema = z.strictObject({
   createdAt: z.iso.datetime(),
   id: z.uuid(),
@@ -74,6 +79,8 @@ async function createPost({
   input: z.infer<typeof createSchema>;
   parentId?: string | null;
 }) {
+  const selection = input.gifToken ? readGifSelection(input.gifToken, userId) : null;
+  const gif = selection?.gif ?? null;
   const id = await db.transaction(async (tx) => {
     let parentAuthor: string | undefined;
     if (parentId) {
@@ -85,16 +92,21 @@ async function createPost({
       if (!parent) throw new AuthError(404, "post_not_found");
       parentAuthor = parent.authorId;
     }
-    const [saved] = await tx
-      .insert(posts)
-      .values({
-        id: input.clientId,
-        authorId: userId,
-        content: input.content,
-        parentId,
-      })
-      .onConflictDoNothing({ target: posts.id })
-      .returning({ id: posts.id });
+    // An expired selection can confirm an earlier successful write by client ID.
+    const expired = selection && selection.expires < Date.now();
+    const [saved] = expired
+      ? []
+      : await tx
+          .insert(posts)
+          .values({
+            id: input.clientId,
+            authorId: userId,
+            content: input.content,
+            gif,
+            parentId,
+          })
+          .onConflictDoNothing({ target: posts.id })
+          .returning({ id: posts.id });
     if (saved) {
       await syncMentions(tx, saved.id, userId, input.content);
       await syncPostTopics(tx, saved.id, input.content);
@@ -108,13 +120,17 @@ async function createPost({
         });
       return saved.id;
     }
-    if (!input.clientId) throw new Error("Post ID collision");
+    if (!input.clientId) {
+      if (expired) throw new AuthError(400, "invalid_gif_selection");
+      throw new Error("Post ID collision");
+    }
     const [existing] = await tx
       .select({
         id: posts.id,
         authorId: posts.authorId,
         parentId: posts.parentId,
         content: posts.content,
+        gif: posts.gif,
       })
       .from(posts)
       .where(eq(posts.id, input.clientId));
@@ -122,9 +138,12 @@ async function createPost({
       !existing ||
       existing.authorId !== userId ||
       existing.parentId !== parentId ||
-      existing.content !== input.content
+      existing.content !== input.content ||
+      existing.gif?.url !== gif?.url
     )
-      throw new AuthError(409, "post_id_conflict");
+      throw expired
+        ? new AuthError(400, "invalid_gif_selection")
+        : new AuthError(409, "post_id_conflict");
     return existing.id;
   });
   return findPost(id, userId);
@@ -439,6 +458,7 @@ router.patch("/:id", async (req, res) => {
       .select({
         authorId: posts.authorId,
         content: posts.content,
+        gif: posts.gif,
         createdAt: posts.createdAt,
         editedAt: posts.editedAt,
       })
@@ -448,6 +468,8 @@ router.patch("/:id", async (req, res) => {
     if (!existing) throw new AuthError(404, "post_not_found");
     if (existing.authorId !== user.id)
       throw new AuthError(403, "not_post_author");
+    if (!parsed.data.content && !existing.gif)
+      throw new AuthError(400, "invalid_content");
     const [saved] = await tx
       .update(posts)
       .set({ content: parsed.data.content, editedAt: sql`clock_timestamp()` })

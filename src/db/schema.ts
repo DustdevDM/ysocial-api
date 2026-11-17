@@ -1,4 +1,5 @@
 import type { BannerCrop } from "../storage/banner-crop.ts";
+import type { KlipyGif } from "../storage/klipy.ts";
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
@@ -100,6 +101,7 @@ export const posts = pgTable(
       onDelete: "cascade",
     }),
     content: text().notNull(),
+    gif: jsonb().$type<KlipyGif>(),
     createdAt: timestamp("created_at", { withTimezone: true, precision: 3 })
       .notNull()
       .defaultNow(),
@@ -114,7 +116,7 @@ export const posts = pgTable(
     index("posts_feed_idx").on(table.createdAt.desc(), table.id.desc()),
     check(
       "posts_content_check",
-      sql`char_length(${table.content}) BETWEEN 1 AND 2000 AND ${table.content} ~ '[^[:space:]]'`,
+      sql`char_length(${table.content}) <= 2000 AND (${table.content} ~ '[^[:space:]]' OR (${table.content} = '' AND ${table.gif} IS NOT NULL))`,
     ),
   ],
 );

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -9,7 +9,7 @@ import { migrate } from "drizzle-orm/node-postgres/migrator";
 
 config({ path: new URL("../.env", import.meta.url), quiet: true });
 
-test("post reply totals include every descendant and track subtree deletion", async () => {
+test("post and reply flows", async (t) => {
   const admin = new pg.Pool({ connectionString: process.env.DATABASE_URL });
   const name = `ysocial_replies_test_${randomUUID().replaceAll("-", "")}`;
   const url = new URL(process.env.DATABASE_URL);
@@ -20,6 +20,7 @@ test("post reply totals include every descendant and track subtree deletion", as
     Object.assign(process.env, {
       DATABASE_URL: url.href,
       NODE_ENV: "test",
+      KLIPY_API_KEY: "reply-tests-key",
       R2_ACCOUNT_ID: "a".repeat(32),
       R2_BUCKET: "reply-tests",
       R2_ACCESS_KEY_ID: "test",
@@ -77,43 +78,120 @@ test("post reply totals include every descendant and track subtree deletion", as
       assert.equal((await get(`/api/posts/${id}`)).post.replies, expected);
     }
 
-    const root = await create();
-    const unrelated = await create();
-    await create(unrelated.id);
-    await count(root.id, 0);
-    const comment = await create(root.id);
-    await count(root.id, 1);
-    const replyId = randomUUID();
-    const reply = await create(comment.id, replyId);
-    await count(root.id, 2);
-    await count(comment.id, 1);
-    // Retrying the same write must not inflate any ancestor's total.
-    assert.equal((await create(comment.id, replyId)).id, reply.id);
-    await create(reply.id);
-    const sibling = await create(root.id);
-    await count(root.id, 4);
-    await count(comment.id, 2);
-    await count(reply.id, 1);
-    await count(sibling.id, 0);
-    await count(unrelated.id, 1);
+    await t.test("reply totals include every descendant and track subtree deletion", async () => {
+      const root = await create();
+      const unrelated = await create();
+      await create(unrelated.id);
+      await count(root.id, 0);
+      const comment = await create(root.id);
+      await count(root.id, 1);
+      const replyId = randomUUID();
+      const reply = await create(comment.id, replyId);
+      await count(root.id, 2);
+      await count(comment.id, 1);
+      // Retrying the same write must not inflate any ancestor's total.
+      assert.equal((await create(comment.id, replyId)).id, reply.id);
+      await create(reply.id);
+      const sibling = await create(root.id);
+      await count(root.id, 4);
+      await count(comment.id, 2);
+      await count(reply.id, 1);
+      await count(sibling.id, 0);
+      await count(unrelated.id, 1);
 
-    const feed = await get("/api/posts");
-    assert.equal(feed.posts.find((post) => post.id === root.id).replies, 4);
-    const children = await get(`/api/posts/${root.id}/replies`);
-    assert.deepEqual(new Set(children.posts.map((post) => post.id)), new Set([comment.id, sibling.id]));
-    assert.equal(children.posts.find((post) => post.id === comment.id).replies, 2);
-    const profile = await get("/api/profiles/reply_author");
-    assert.equal(profile.posts.find((post) => post.id === root.id).replies, 4);
-    assert.equal(profile.replies.find(({ post }) => post.id === reply.id).thread[0].replies, 4);
+      const feed = await get("/api/posts");
+      assert.equal(feed.posts.find((post) => post.id === root.id).replies, 4);
+      const children = await get(`/api/posts/${root.id}/replies`);
+      assert.deepEqual(new Set(children.posts.map((post) => post.id)), new Set([comment.id, sibling.id]));
+      assert.equal(children.posts.find((post) => post.id === comment.id).replies, 2);
+      const profile = await get("/api/profiles/reply_author");
+      assert.equal(profile.posts.find((post) => post.id === root.id).replies, 4);
+      assert.equal(profile.replies.find(({ post }) => post.id === reply.id).thread[0].replies, 4);
 
-    assert.equal((await request(`/api/posts/${reply.id}`, "DELETE")).status, 204);
-    await count(root.id, 2);
-    await count(comment.id, 0);
-    assert.equal((await request(`/api/posts/${comment.id}`, "DELETE")).status, 204);
-    await count(root.id, 1);
-    assert.equal((await request(`/api/posts/${sibling.id}`, "DELETE")).status, 204);
-    await count(root.id, 0);
-    await count(unrelated.id, 1);
+      assert.equal((await request(`/api/posts/${reply.id}`, "DELETE")).status, 204);
+      await count(root.id, 2);
+      await count(comment.id, 0);
+      assert.equal((await request(`/api/posts/${comment.id}`, "DELETE")).status, 204);
+      await count(root.id, 1);
+      assert.equal((await request(`/api/posts/${sibling.id}`, "DELETE")).status, 204);
+      await count(root.id, 0);
+      await count(unrelated.id, 1);
+    });
+
+    await t.test("KLIPY GIFs survive publishing, retries, and caption edits", async () => {
+      const url = "https://static.klipy.com/test/wave.gif";
+      const title = "Waving hello";
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = (input, options) => {
+        const target = new URL(input);
+        if (target.hostname !== "api.klipy.com") return originalFetch(input, options);
+        assert.equal(target.pathname, `/api/v1/${env.KLIPY_API_KEY}/gifs/search`);
+        assert.equal(target.searchParams.get("q"), "wave");
+        return Promise.resolve(Response.json({
+          result: true,
+          data: { data: [{
+            slug: "wave",
+            title,
+            type: "gif",
+            file: { hd: { gif: { url } }, sm: { gif: { url } } },
+          }] },
+        }));
+      };
+      let gifToken;
+      try {
+        const response = await request("/api/banners/gifs/search", "POST", { query: "wave" });
+        assert.equal(response.status, 200);
+        gifToken = (await response.json()).items[0].token;
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+
+      const clientId = randomUUID();
+      const send = (body) => request("/api/posts", "POST", body);
+      assert.equal((await send({ content: " " })).status, 400);
+      assert.equal((await send({ gifToken: `${gifToken}tampered` })).status, 400);
+      const response = await send({ clientId, gifToken });
+      assert.equal(response.status, 201);
+      const { post } = await response.json();
+      assert.equal(post.content, "");
+      assert.deepEqual(post.gif, { url, title });
+      assert.equal((await send({ clientId, gifToken })).status, 201);
+      assert.equal((await send({ clientId, content: "Different post" })).status, 409);
+
+      const [payload] = gifToken.split(".");
+      const expired = Buffer.from(JSON.stringify({
+        ...JSON.parse(Buffer.from(payload, "base64url").toString()),
+        expires: Date.now() - 1000,
+      })).toString("base64url");
+      const signature = createHmac("sha256", env.KLIPY_API_KEY).update(expired).digest("base64url");
+      const expiredToken = `${expired}.${signature}`;
+      assert.equal((await send({ clientId, gifToken: expiredToken })).status, 201);
+      assert.equal((await send({ clientId: randomUUID(), gifToken: expiredToken })).status, 400);
+
+      const path = `/api/posts/${post.id}`;
+      const reply = await request(`${path}/replies`, "POST", { content: " #hello ", gifToken });
+      assert.equal(reply.status, 201);
+      const { post: child } = await reply.json();
+      assert.equal(child.content, "#hello");
+      assert.deepEqual(child.gif, post.gif);
+
+      for (const content of ["Caption", ""]) {
+        const edited = await request(path, "PATCH", { content });
+        assert.equal(edited.status, 200);
+        const result = (await edited.json()).post;
+        assert.equal(result.content, content);
+        assert.deepEqual(result.gif, post.gif);
+      }
+      const textOnly = await create();
+      assert.equal(textOnly.gif, null);
+      assert.equal((await request(`/api/posts/${textOnly.id}`, "PATCH", { content: "" })).status, 400);
+
+      const feed = await get("/api/posts");
+      assert.deepEqual(feed.posts.find((row) => row.id === post.id).gif, post.gif);
+      const thread = await get(`${path}/thread`);
+      assert.deepEqual(thread.post.gif, post.gif);
+      assert.deepEqual(thread.replies[0].gif, child.gif);
+    });
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));
     await pool?.end();

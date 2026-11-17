@@ -1,5 +1,5 @@
 import * as webpush from "web-push";
-import { and, eq, lte } from "drizzle-orm";
+import { and, eq, lte, sql } from "drizzle-orm";
 import { db } from "./db/index.ts";
 import {
   authSessions,
@@ -49,6 +49,7 @@ export async function flushPushDeliveries(send = webpush.sendNotification) {
           subscription: pushSubscriptions,
           actor: userSelection,
           content: posts.content,
+          hasGif: sql<boolean>`${posts.gif} IS NOT NULL`,
           expiresAt: authSessions.expiresAt,
         })
         .from(notifications)
@@ -78,8 +79,9 @@ export async function flushPushDeliveries(send = webpush.sendNotification) {
       const { notification, subscription, actor } = event;
       const summary = `${actor.displayName || actor.handle} ${descriptions[notification.kind]}`;
       const preview =
-        (notification.kind === "reply" || notification.kind === "mention") && event.content
-          ? notificationPreview(event.content)
+        (notification.kind === "reply" || notification.kind === "mention") &&
+        event.content !== null
+          ? notificationPreview(event.content, event.hasGif)
           : null;
       try {
         await send(

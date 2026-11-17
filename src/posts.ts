@@ -6,12 +6,14 @@ import {
   repostSelection,
 } from "./post-data.ts";
 import { Router, type Request } from "express";
-import { and, desc, eq, isNull, lt, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db/index.ts";
-import { postLikes, postReposts, posts, users } from "./db/schema.ts";
+import { postEdits, postLikes, postReposts, posts, users } from "./db/schema.ts";
 import { requireUser, readViewerId } from "./auth/request.ts";
+import { userSelection } from "./user-data.ts";
 import { AuthError } from "./auth/provider.ts";
+import { notify, unnotify } from "./notifications.ts";
 
 const router = Router();
 const contentSchema = z.strictObject({
@@ -48,13 +50,15 @@ async function createPost({
   parentId?: string | null;
 }) {
   const id = await db.transaction(async (tx) => {
+    let parentAuthorId: string | null = null;
     if (parentId) {
       const [parent] = await tx
-        .select({ id: posts.id })
+        .select({ id: posts.id, authorId: posts.authorId })
         .from(posts)
         .where(eq(posts.id, parentId))
         .for("key share");
       if (!parent) throw new AuthError(404, "post_not_found");
+      parentAuthorId = parent.authorId;
     }
     const [saved] = await tx
       .insert(posts)
@@ -66,7 +70,16 @@ async function createPost({
       })
       .onConflictDoNothing({ target: posts.id })
       .returning({ id: posts.id });
-    if (saved) return saved.id;
+    if (saved) {
+      if (parentAuthorId)
+        await notify(tx, {
+          userId: parentAuthorId,
+          actorId: userId,
+          kind: "reply",
+          postId: saved.id,
+        });
+      return saved.id;
+    }
     if (!input.clientId) throw new Error("Post ID collision");
     const [existing] = await tx
       .select({
@@ -166,6 +179,117 @@ router.get("/:id", async (req, res) => {
     serverNow: new Date().toISOString(),
   });
 });
+const THREAD_MAX_DEPTH = 12;
+const THREAD_MAX_REPLIES = 300;
+// Full conversation around a post: the chain above it (root first) and every
+// nested reply below it (shallowest first, then oldest first), so clients can
+// render a collapsible tree without one request per level.
+router.get("/:id/thread", async (req, res) => {
+  const id = req.params.id;
+  const viewerId = await readViewerId(req);
+  const post = await findPost(id, viewerId);
+  const [ancestorRows, descendantRows] = await Promise.all([
+    db.execute<{ id: string }>(sql`
+      with recursive chain as (
+        select id, parent_id, 0 as depth from posts where id = ${id}
+        union all
+        select p.id, p.parent_id, c.depth + 1
+        from posts p join chain c on p.id = c.parent_id
+        where c.depth < 100
+      )
+      select id from chain where depth > 0 order by depth desc
+    `),
+    db.execute<{ id: string }>(sql`
+      with recursive tree as (
+        select id, 1 as depth from posts where parent_id = ${id}
+        union all
+        select p.id, t.depth + 1
+        from posts p join tree t on p.parent_id = t.id
+        where t.depth < ${THREAD_MAX_DEPTH}
+      )
+      select t.id from tree t join posts p on p.id = t.id
+      order by t.depth, p.created_at, p.id
+      limit ${THREAD_MAX_REPLIES + 1}
+    `),
+  ]);
+  const ancestorIds = ancestorRows.rows.map((row) => row.id);
+  const truncated = descendantRows.rows.length > THREAD_MAX_REPLIES;
+  const descendantIds = descendantRows.rows
+    .slice(0, THREAD_MAX_REPLIES)
+    .map((row) => row.id);
+  const wanted = [...ancestorIds, ...descendantIds];
+  const rows = wanted.length
+    ? await db
+        .select(postSelection(viewerId))
+        .from(posts)
+        .innerJoin(users, eq(users.id, posts.authorId))
+        .where(inArray(posts.id, wanted))
+    : [];
+  const byId = new Map(rows.map((row) => [row.id, serializePost(row)]));
+  const pick = (ids: string[]) =>
+    ids.flatMap((postId) => {
+      const found = byId.get(postId);
+      return found ? [found] : [];
+    });
+  res.json({
+    post,
+    ancestors: pick(ancestorIds),
+    replies: pick(descendantIds),
+    truncated,
+    serverNow: new Date().toISOString(),
+  });
+});
+// People who liked or reposted a post, 20 per page.
+router.get("/:id/activity", async (req, res) => {
+  const type = req.query.type;
+  if (type !== "likes" && type !== "reposts")
+    throw new AuthError(400, "invalid_activity_type");
+  await findPost(req.params.id);
+  let after: string | undefined;
+  if (req.query.cursor !== undefined) {
+    const parsed = z
+      .uuid()
+      .safeParse(
+        typeof req.query.cursor === "string"
+          ? Buffer.from(req.query.cursor, "base64url").toString("utf8")
+          : "",
+      );
+    if (!parsed.success) throw new AuthError(400, "invalid_cursor");
+    after = parsed.data;
+  }
+  const table = type === "likes" ? postLikes : postReposts;
+  const rows = await db
+    .select(userSelection)
+    .from(table)
+    .innerJoin(users, eq(users.id, table.userId))
+    .where(and(eq(table.postId, req.params.id), after ? gt(users.id, after) : undefined))
+    .orderBy(users.id)
+    .limit(21);
+  const page = rows.slice(0, 20);
+  const last = page.at(-1);
+  res.json({
+    users: page,
+    nextCursor:
+      rows.length > 20 && last
+        ? Buffer.from(last.id).toString("base64url")
+        : null,
+  });
+});
+// Edit history, newest version first (the current text is the first entry).
+router.get("/:id/edits", async (req, res) => {
+  const post = await findPost(req.params.id);
+  const earlier = await db
+    .select({ content: postEdits.content, at: postEdits.versionAt })
+    .from(postEdits)
+    .where(eq(postEdits.postId, post.id))
+    .orderBy(desc(postEdits.versionAt));
+  res.json({
+    versions: [
+      { content: post.content, at: post.editedAt ?? post.createdAt },
+      ...earlier,
+    ],
+  });
+});
 router.get("/:id/replies", listPosts);
 router.post("/:id/replies", async (req, res) => {
   const user = await requireUser(req);
@@ -188,17 +312,25 @@ async function setLike(req: Request, liked: boolean) {
   return db.transaction(async (tx) => {
     // Serialize writes to this post, so retries and concurrent likes return a consistent count.
     const [post] = await tx
-      .select({ id: posts.id })
+      .select({ id: posts.id, authorId: posts.authorId })
       .from(posts)
       .where(eq(posts.id, id))
       .for("update");
     if (!post) throw new AuthError(404, "post_not_found");
+    const event = {
+      userId: post.authorId,
+      actorId: user.id,
+      kind: "like" as const,
+      postId: id,
+    };
     if (liked) {
       await tx
         .insert(postLikes)
         .values({ postId: id, userId: user.id })
         .onConflictDoNothing();
+      await notify(tx, event);
     } else {
+      await unnotify(tx, event);
       await tx
         .delete(postLikes)
         .where(and(eq(postLikes.postId, id), eq(postLikes.userId, user.id)));
@@ -223,17 +355,25 @@ async function setRepost(req: Request, reposted: boolean) {
   const id = parsedId.data;
   return db.transaction(async (tx) => {
     const [post] = await tx
-      .select({ id: posts.id })
+      .select({ id: posts.id, authorId: posts.authorId })
       .from(posts)
       .where(eq(posts.id, id))
       .for("update");
     if (!post) throw new AuthError(404, "post_not_found");
+    const event = {
+      userId: post.authorId,
+      actorId: user.id,
+      kind: "repost" as const,
+      postId: id,
+    };
     if (reposted) {
       await tx
         .insert(postReposts)
         .values({ postId: id, userId: user.id })
         .onConflictDoNothing();
+      await notify(tx, event);
     } else {
+      await unnotify(tx, event);
       await tx
         .delete(postReposts)
         .where(
@@ -260,7 +400,12 @@ router.patch("/:id", async (req, res) => {
   const updated = await db.transaction(async (tx) => {
     // Acquire the row before evaluating the clock, including waits for other writers.
     const [existing] = await tx
-      .select({ authorId: posts.authorId })
+      .select({
+        authorId: posts.authorId,
+        content: posts.content,
+        createdAt: posts.createdAt,
+        editedAt: posts.editedAt,
+      })
       .from(posts)
       .where(eq(posts.id, req.params.id))
       .for("update");
@@ -278,6 +423,12 @@ router.patch("/:id", async (req, res) => {
       )
       .returning(postFields);
     if (!saved) throw new AuthError(409, "edit_window_expired");
+    if (existing.content !== parsed.data.content)
+      await tx.insert(postEdits).values({
+        postId: req.params.id,
+        content: existing.content,
+        versionAt: existing.editedAt ?? existing.createdAt,
+      });
     return saved;
   });
   res.json({

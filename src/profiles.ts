@@ -14,6 +14,7 @@ import { z } from "zod";
 import { db } from "./db/index.ts";
 import { posts, postReposts, users, userFollows } from "./db/schema.ts";
 import { AuthError } from "./auth/provider.ts";
+import { notify, unnotify } from "./notifications.ts";
 import { postSelection, serializePost } from "./post-data.ts";
 import { userSelection } from "./user-data.ts";
 
@@ -183,7 +184,9 @@ async function setFollow(req: Request, follow: boolean) {
         .insert(userFollows)
         .values({ followerId: viewer.id, followingId: target.id })
         .onConflictDoNothing();
+      await notify(tx, { userId: target.id, actorId: viewer.id, kind: "follow" });
     } else {
+      await unnotify(tx, { userId: target.id, actorId: viewer.id, kind: "follow" });
       await tx
         .delete(userFollows)
         .where(

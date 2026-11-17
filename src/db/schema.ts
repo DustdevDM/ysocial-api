@@ -2,6 +2,7 @@ import type { BannerCrop } from "../storage/banner-crop.ts";
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
+  boolean,
   check,
   integer,
   jsonb,
@@ -116,6 +117,21 @@ export const posts = pgTable(
   ],
 );
 
+// Earlier versions of edited posts, saved when an edit replaces them.
+export const postEdits = pgTable(
+  "post_edits",
+  {
+    id: uuid().defaultRandom().primaryKey(),
+    postId: uuid("post_id")
+      .notNull()
+      .references(() => posts.id, { onDelete: "cascade" }),
+    content: text().notNull(),
+    // When this version was written: the post's creation or its previous edit.
+    versionAt: timestamp("version_at", { withTimezone: true, precision: 3 }).notNull(),
+  },
+  (table) => [index("post_edits_post_idx").on(table.postId, table.versionAt.desc())],
+);
+
 export const postLikes = pgTable(
   "post_likes",
   {
@@ -177,6 +193,50 @@ export const userFollows = pgTable(
     ),
   ],
 );
+
+// Inbox entries for likes, reposts, replies and follows. `postId` is the post
+// that was liked/reposted, or the new reply.
+export const notifications = pgTable(
+  "notifications",
+  {
+    id: uuid().defaultRandom().primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    actorId: uuid("actor_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    kind: text().notNull(),
+    postId: uuid("post_id").references(() => posts.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true, precision: 3 })
+      .notNull()
+      .defaultNow(),
+    readAt: timestamp("read_at", { withTimezone: true, precision: 3 }),
+  },
+  (table) => [
+    index("notifications_user_idx").on(
+      table.userId,
+      table.createdAt.desc(),
+      table.id.desc(),
+    ),
+    unique("notifications_event_unique")
+      .on(table.userId, table.actorId, table.kind, table.postId)
+      .nullsNotDistinct(),
+    check(
+      "notifications_kind_check",
+      sql`${table.kind} in ('like', 'repost', 'reply', 'follow')`,
+    ),
+  ],
+);
+
+export const pushSettings = pgTable("push_settings", {
+  userId: uuid("user_id")
+    .primaryKey()
+    .references(() => users.id, { onDelete: "cascade" }),
+  promptDismissed: boolean("prompt_dismissed").notNull().default(false),
+  mutedUntil: timestamp("muted_until", { withTimezone: true }),
+  mutedForever: boolean("muted_forever").notNull().default(false),
+});
 
 // Durable outbox for replacements, removals, and unfinished uploads.
 export const mediaDeletions = pgTable(

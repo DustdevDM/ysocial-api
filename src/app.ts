@@ -5,6 +5,7 @@ import avatars from "./avatars.ts";
 import { checkAvatarStorage } from "./storage/r2.ts";
 import profiles from "./profiles.ts";
 import posts from "./posts.ts";
+import notifications from "./notifications.ts";
 import { AuthError } from "./auth/provider.ts";
 import express, { type ErrorRequestHandler } from "express";
 import pg from "pg";
@@ -40,6 +41,11 @@ app.use("/api/posts", posts);
 app.use("/api/profiles", profiles);
 app.use("/api/avatars", avatars);
 app.use("/api/banners", banners);
+app.use("/api/notifications", notifications);
+// Unknown API routes answer in JSON like every other API error.
+app.use(["/api", "/auth"], (_req, res) => {
+  res.status(404).json({ error: "route_not_found" });
+});
 
 app.get("/", (_req, res) => {
   res.redirect("https://docs.ysocial.cc/");

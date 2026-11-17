@@ -26,6 +26,8 @@ import { AuthError } from "./auth/provider.ts";
 import { userSelection } from "./user-data.ts";
 import { recordNotification } from "./notification-events.ts";
 
+import { syncMentions } from "./mentions.ts";
+
 const router = Router();
 const contentSchema = z.strictObject({
   content: z
@@ -37,7 +39,11 @@ const contentSchema = z.strictObject({
       return length > 0 && length <= 2000;
     }),
 });
-const createSchema = contentSchema.extend({ clientId: z.uuid().optional() });
+const createSchema = contentSchema.extend({
+  clientId: z.uuid().optional(),
+  // Text-only web posts include this field. Uploaded attachments are not supported yet.
+  attachmentIds: z.array(z.uuid()).max(0).optional(),
+});
 const cursorSchema = z.strictObject({
   createdAt: z.iso.datetime(),
   id: z.uuid(),
@@ -82,6 +88,7 @@ async function createPost({
       .onConflictDoNothing({ target: posts.id })
       .returning({ id: posts.id });
     if (saved) {
+      await syncMentions(tx, saved.id, userId, input.content);
       if (parentAuthor)
         await recordNotification(tx, {
           recipientId: parentAuthor,
@@ -435,6 +442,7 @@ router.patch("/:id", async (req, res) => {
         content: existing.content,
         versionAt: existing.editedAt ?? existing.createdAt,
       });
+    await syncMentions(tx, saved.id, user.id, parsed.data.content);
     return saved;
   });
   res.json({

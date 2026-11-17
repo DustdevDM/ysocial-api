@@ -117,6 +117,7 @@ if (import.meta.main) {
       to_regclass('public.post_likes') IS NOT NULL AND
       to_regclass('public.media_deletions') IS NOT NULL AND
       to_regclass('public.posts') IS NOT NULL AND
+      to_regclass('public.post_mentions') IS NOT NULL AND
       to_regclass('public.users') IS NOT NULL AND
       EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'notification_prompt_dismissed') AND
       EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'banner_crop') AND

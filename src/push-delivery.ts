@@ -18,6 +18,7 @@ const descriptions = {
   repost: "reposted your post",
   reply: "replied to your post",
   follow: "followed you",
+  mention: "mentioned you in a post",
 };
 
 export async function flushPushDeliveries(send = webpush.sendNotification) {
@@ -77,7 +78,7 @@ export async function flushPushDeliveries(send = webpush.sendNotification) {
       const { notification, subscription, actor } = event;
       const summary = `${actor.displayName || actor.handle} ${descriptions[notification.kind]}`;
       const preview =
-        notification.kind === "reply" && event.content
+        (notification.kind === "reply" || notification.kind === "mention") && event.content
           ? notificationPreview(event.content)
           : null;
       try {

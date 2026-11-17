@@ -209,11 +209,18 @@ export const mediaDeletions = pgTable(
   (table) => [index("media_deletions_due_idx").on(table.availableAt)],
 );
 
+export const postMentions = pgTable("post_mentions", {
+  postId: uuid("post_id").notNull().references(() => posts.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  handle: text().notNull(),
+}, (table) => [primaryKey({ columns: [table.postId, table.userId, table.handle] })]);
+
 export const notificationKind = pgEnum("notification_kind", [
   "like",
   "repost",
   "reply",
   "follow",
+  "mention",
 ]);
 export const notifications = pgTable(
   "notifications",

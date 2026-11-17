@@ -58,6 +58,10 @@ export const postSelection = (viewerId: string | null) => ({
   ...friendLikeSelection(viewerId),
   ...repostSelection(viewerId),
   ...postFields,
+  mentions: sql<{ id: string; handle: string; username: string }[]>`(
+    select coalesce(json_agg(json_build_object('id', u.id, 'handle', u.handle, 'username', m.handle)), '[]'::json)
+    from post_mentions m join users u on u.id = m.user_id where m.post_id = ${posts.id}
+  )`,
   replies: sql<number>`(
     with recursive descendants(id) as (
       select reply.id from posts reply

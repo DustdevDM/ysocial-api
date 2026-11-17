@@ -5,6 +5,8 @@ import avatars from "./avatars.ts";
 import { checkAvatarStorage } from "./storage/r2.ts";
 import profiles from "./profiles.ts";
 import posts from "./posts.ts";
+import notifications from "./notifications.ts";
+import { startPushDelivery } from "./push-delivery.ts";
 import { AuthError } from "./auth/provider.ts";
 import express, { type ErrorRequestHandler } from "express";
 import pg from "pg";
@@ -37,6 +39,7 @@ app.post("/webhooks/cns", (_req, res) => {
 app.use(express.json({ limit: "16kb" }));
 app.use("/auth", auth);
 app.use("/api/posts", posts);
+app.use("/api/notifications", notifications);
 app.use("/api/profiles", profiles);
 app.use("/api/avatars", avatars);
 app.use("/api/banners", banners);
@@ -79,6 +82,7 @@ app.use(handleError);
 if (import.meta.main) {
   const shutdown = new AbortController();
   let stopMediaCleanup = () => {};
+  let stopPushDelivery = () => {};
   const server = app.listen(env.PORT, () =>
     console.info(`API listening on port ${env.PORT}`),
   );
@@ -91,6 +95,7 @@ if (import.meta.main) {
       startupReady = false;
       shutdown.abort();
       stopMediaCleanup();
+      stopPushDelivery();
       setTimeout(() => {
         server.close(() => { void pool.end(); });
         server.closeIdleConnections();
@@ -109,8 +114,13 @@ if (import.meta.main) {
       to_regclass('public.media_deletions') IS NOT NULL AND
       to_regclass('public.posts') IS NOT NULL AND
       to_regclass('public.users') IS NOT NULL AND
+      EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'notification_prompt_dismissed') AND
       EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'banner_crop') AND
       to_regclass('public.user_follows') IS NOT NULL AND
+      to_regclass('public.notifications') IS NOT NULL AND
+      to_regclass('public.push_subscriptions') IS NOT NULL AND
+      EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'push_subscriptions' AND column_name = 'muted_forever') AND
+      to_regclass('public.push_deliveries') IS NOT NULL AND
       to_regclass('public.auth_sessions') IS NOT NULL AND
       to_regclass('public.auth_identities') IS NOT NULL AND
       to_regclass('public.oauth_transactions') IS NOT NULL AS ready`);
@@ -122,6 +132,7 @@ if (import.meta.main) {
     if (env.R2) await checkAvatarStorage();
     shutdown.signal.throwIfAborted();
     stopMediaCleanup = startMediaCleanup();
+    stopPushDelivery = startPushDelivery();
     startupReady = true;
   } catch (error) {
     if (!shutdown.signal.aborted) {

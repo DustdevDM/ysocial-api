@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "notification_prompt_dismissed" boolean DEFAULT false NOT NULL;

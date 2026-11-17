@@ -66,6 +66,8 @@ test("mentions resolve, notify, edit, and deduplicate through the API", async ()
     }
     const { rows: [target] } = await pool.query("INSERT INTO users (handle) VALUES ('tag_target') RETURNING id");
     await pool.query("INSERT INTO users (handle) VALUES ('tag_tom'), ('tag_tina'), ('other_tag'), ('tag_tim')");
+    const anonymous = await fetch(base + '/api/profiles/suggestions?q=tag', { headers: { Origin: env.APP_ORIGIN } });
+    assert.equal(anonymous.status, 401);
     const suggestions = await get('/api/profiles/suggestions?q=TAG_T');
     assert.equal(suggestions.users.length, 3);
     assert.deepEqual(suggestions.users.map((user) => user.handle), ['tag_target', 'tag_tim', 'tag_tina']);

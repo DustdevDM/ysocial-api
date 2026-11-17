@@ -25,6 +25,7 @@ router.use((_req, res, next) => {
   next();
 });
 router.get("/suggestions", async (req, res) => {
+  await requireUser(req);
   const query = z.string().regex(/^[a-z0-9_]{0,32}$/i).safeParse(req.query.q);
   if (!query.success) throw new AuthError(400, "invalid_handle");
   const term = query.data.toLowerCase();

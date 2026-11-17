@@ -62,6 +62,7 @@ export const postSelection = (viewerId: string | null) => ({
     select coalesce(json_agg(json_build_object('id', u.id, 'handle', u.handle, 'username', m.handle)), '[]'::json)
     from post_mentions m join users u on u.id = m.user_id where m.post_id = ${posts.id}
   )`,
+  topics: sql<string[]>`coalesce((select array_agg(pt.topic order by pt.topic) from post_topics pt where pt.post_id = ${posts.id}), '{}')`,
   replies: sql<number>`(
     with recursive descendants(id) as (
       select reply.id from posts reply

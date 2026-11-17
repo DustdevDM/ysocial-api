@@ -6,6 +6,7 @@ import { checkAvatarStorage } from "./storage/r2.ts";
 import profiles from "./profiles.ts";
 import posts from "./posts.ts";
 import notifications from "./notifications.ts";
+import topics from "./topics.ts";
 import { startPushDelivery } from "./push-delivery.ts";
 import { AuthError } from "./auth/provider.ts";
 import express, { type ErrorRequestHandler } from "express";
@@ -40,6 +41,7 @@ app.use(express.json({ limit: "16kb" }));
 app.use("/auth", auth);
 app.use("/api/posts", posts);
 app.use("/api/notifications", notifications);
+app.use("/api/topics", topics);
 app.use("/api/profiles", profiles);
 app.use("/api/avatars", avatars);
 app.use("/api/banners", banners);
@@ -115,6 +117,7 @@ if (import.meta.main) {
     shutdown.signal.throwIfAborted();
     const schema = await pool.query<{ ready: boolean }>(`SELECT
       to_regclass('public.post_likes') IS NOT NULL AND
+      to_regclass('public.post_topics') IS NOT NULL AND
       to_regclass('public.media_deletions') IS NOT NULL AND
       to_regclass('public.posts') IS NOT NULL AND
       to_regclass('public.post_mentions') IS NOT NULL AND

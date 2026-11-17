@@ -119,6 +119,26 @@ export const posts = pgTable(
   ],
 );
 
+// Topics (#name) used by top-level posts. A topic exists while a post uses it;
+// the primary key counts a topic once per post however often the text repeats it.
+export const postTopics = pgTable(
+  "post_topics",
+  {
+    postId: uuid("post_id")
+      .notNull()
+      .references(() => posts.id, { onDelete: "cascade" }),
+    topic: text().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.postId, table.topic] }),
+    index("post_topics_topic_idx").on(table.topic, table.postId),
+    check(
+      "post_topics_topic_check",
+      sql`char_length(${table.topic}) BETWEEN 1 AND 32`,
+    ),
+  ],
+);
+
 // Earlier versions of edited posts, saved when an edit replaces them.
 export const postEdits = pgTable(
   "post_edits",

@@ -31,7 +31,16 @@ export const postSelection = (viewerId: string | null) => ({
   ...reactionSelection(viewerId),
   ...repostSelection(viewerId),
   ...postFields,
-  replies: sql<number>`(select count(*)::int from posts reply where reply.parent_id = ${posts.id})`,
+  replies: sql<number>`(
+    with recursive descendants(id) as (
+      select reply.id from posts reply
+      where reply.parent_id = ${posts}.${sql.identifier(posts.id.name)}
+      union all
+      select reply.id from posts reply
+      join descendants on reply.parent_id = descendants.id
+    )
+    select count(*)::int from descendants
+  )`,
   author: userSelection,
 });
 type PostRow = { createdAt: Date };

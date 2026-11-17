@@ -97,7 +97,7 @@ async function createPost({
       .returning({ id: posts.id });
     if (saved) {
       await syncMentions(tx, saved.id, userId, input.content);
-      if (!parentId) await syncPostTopics(tx, saved.id, input.content);
+      await syncPostTopics(tx, saved.id, input.content);
       if (parentAuthor)
         await recordNotification(tx, {
           recipientId: parentAuthor,
@@ -138,7 +138,6 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
     typeof req.params.id === "string" ? req.params.id : undefined;
   if (parentId) await findPost(parentId);
   const viewerId = await readViewerId(req);
-  // Topics only tag top-level posts, so a topic filter is a top-level feed.
   const topic =
     !parentId && req.query.topic !== undefined
       ? parseTopicName(req.query.topic)
@@ -161,7 +160,8 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
     .innerJoin(users, eq(users.id, posts.authorId))
     .where(
       and(
-        parentId ? eq(posts.parentId, parentId) : isNull(posts.parentId),
+        parentId ? eq(posts.parentId, parentId) : undefined,
+        !parentId && !topic ? isNull(posts.parentId) : undefined,
         topic
           ? inArray(
               posts.id,
@@ -438,7 +438,6 @@ router.patch("/:id", async (req, res) => {
     const [existing] = await tx
       .select({
         authorId: posts.authorId,
-        parentId: posts.parentId,
         content: posts.content,
         createdAt: posts.createdAt,
         editedAt: posts.editedAt,
@@ -460,8 +459,7 @@ router.patch("/:id", async (req, res) => {
       )
       .returning(postFields);
     if (!saved) throw new AuthError(409, "edit_window_expired");
-    if (!existing.parentId)
-      await syncPostTopics(tx, req.params.id, parsed.data.content);
+    await syncPostTopics(tx, req.params.id, parsed.data.content);
     if (existing.content !== parsed.data.content)
       await tx.insert(postEdits).values({
         postId: req.params.id,

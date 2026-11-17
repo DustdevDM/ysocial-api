@@ -119,7 +119,7 @@ export const posts = pgTable(
   ],
 );
 
-// Topics (#name) used by top-level posts. A topic exists while a post uses it;
+// Topics (#name) used by posts and replies. A topic exists while a post uses it;
 // the primary key counts a topic once per post however often the text repeats it.
 export const postTopics = pgTable(
   "post_topics",

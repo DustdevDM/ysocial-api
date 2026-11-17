@@ -11,7 +11,7 @@ export const TRENDING_WINDOW_HOURS = 24;
 const TRENDING_LIMIT = 3;
 const SUGGESTION_LIMIT = 6;
 
-// Make a top-level post's topics match its text. Call in the transaction that
+// Make a post's topics match its text. Call in the transaction that
 // writes the post. A topic repeated in the text is stored, and counted, once.
 export async function syncPostTopics(
   tx: Transaction,

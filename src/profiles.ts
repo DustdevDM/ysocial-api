@@ -14,9 +14,9 @@ import { z } from "zod";
 import { db } from "./db/index.ts";
 import { posts, postReposts, users, userFollows } from "./db/schema.ts";
 import { AuthError } from "./auth/provider.ts";
-import { notify, unnotify } from "./notifications.ts";
 import { postSelection, serializePost } from "./post-data.ts";
 import { userSelection } from "./user-data.ts";
+import { recordNotification } from "./notification-events.ts";
 
 const router = Router();
 const handleSchema = z.string().regex(/^[a-z0-9_]{3,32}$/);
@@ -26,25 +26,37 @@ router.use((_req, res, next) => {
 });
 router.patch("/me", async (req, res) => {
   const viewer = await requireUser(req);
-  const input = z.strictObject({
-    handle: handleSchema,
-    displayName: z.string().trim().min(1).max(80),
-    bio: z.string().max(160),
-  }).partial().refine((changes) => Object.keys(changes).length > 0).safeParse(req.body);
+  const input = z
+    .strictObject({
+      handle: handleSchema,
+      displayName: z.string().trim().min(1).max(80),
+      bio: z.string().max(160),
+    })
+    .partial()
+    .refine((changes) => Object.keys(changes).length > 0)
+    .safeParse(req.body);
   if (!input.success) throw new AuthError(400, "invalid_profile");
-  const [profile] = await db.update(users)
+  const [profile] = await db
+    .update(users)
     .set({ ...input.data, updatedAt: new Date() })
     .where(eq(users.id, viewer.id))
-    .returning({ handle: users.handle, displayName: users.displayName, bio: users.bio });
+    .returning({
+      handle: users.handle,
+      displayName: users.displayName,
+      bio: users.bio,
+    });
   if (!profile) throw new AuthError(404, "profile_not_found");
   res.json(profile);
 });
 router.get("/:handle/availability", async (req, res) => {
   const handle = handleSchema.safeParse(req.params.handle);
   if (!handle.success) throw new AuthError(400, "invalid_handle");
-  const [existing] = await db.select({ id: users.id }).from(users)
-    .where(eq(users.handle, handle.data)).limit(1);
-  const available = !existing || existing.id === await readViewerId(req);
+  const [existing] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.handle, handle.data))
+    .limit(1);
+  const available = !existing || existing.id === (await readViewerId(req));
   res.json({ available });
 });
 router.get("/:handle", async (req, res) => {
@@ -180,13 +192,20 @@ async function setFollow(req: Request, follow: boolean) {
     if (!target) throw new AuthError(404, "profile_not_found");
     if (target.id === viewer.id) throw new AuthError(400, "cannot_follow_self");
     if (follow) {
-      await tx
+      const [inserted] = await tx
         .insert(userFollows)
         .values({ followerId: viewer.id, followingId: target.id })
-        .onConflictDoNothing();
-      await notify(tx, { userId: target.id, actorId: viewer.id, kind: "follow" });
+        .onConflictDoNothing()
+        .returning();
+      if (inserted)
+        await recordNotification(tx, {
+          recipientId: target.id,
+          actorId: viewer.id,
+          kind: "follow",
+          postId: null,
+          subject: target.id,
+        });
     } else {
-      await unnotify(tx, { userId: target.id, actorId: viewer.id, kind: "follow" });
       await tx
         .delete(userFollows)
         .where(

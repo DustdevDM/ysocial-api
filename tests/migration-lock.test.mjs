@@ -3,7 +3,10 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import test from "node:test";
+import { config } from "dotenv";
 import pg from "pg";
+
+config({ path: new URL("../.env", import.meta.url), quiet: true });
 
 test("migration runner and locked media work with a one-connection pool", { timeout: 30000 }, async (t) => {
   const admin = new pg.Pool({ connectionString: process.env.DATABASE_URL });

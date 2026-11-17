@@ -1,6 +1,6 @@
 {
-  "id": "876d2499-eb37-40b4-93f7-4f81db4669f9",
-  "prevId": "199ab1eb-aaa6-4092-9ee6-089592044a0e",
+  "id": "04ccb4b8-9dfd-4ee1-a6ef-8b8af692ed79",
+  "prevId": "9af4e080-0be8-4fbd-af36-f247493a2e34",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -235,8 +235,8 @@
           "notNull": true,
           "default": "gen_random_uuid()"
         },
-        "user_id": {
-          "name": "user_id",
+        "recipient_id": {
+          "name": "recipient_id",
           "type": "uuid",
           "primaryKey": false,
           "notNull": true
@@ -249,7 +249,8 @@
         },
         "kind": {
           "name": "kind",
-          "type": "text",
+          "type": "notification_kind",
+          "typeSchema": "public",
           "primaryKey": false,
           "notNull": true
         },
@@ -259,26 +260,32 @@
           "primaryKey": false,
           "notNull": false
         },
+        "subject": {
+          "name": "subject",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "read_at": {
+          "name": "read_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp (3) with time zone",
           "primaryKey": false,
           "notNull": true,
           "default": "now()"
-        },
-        "read_at": {
-          "name": "read_at",
-          "type": "timestamp (3) with time zone",
-          "primaryKey": false,
-          "notNull": false
         }
       },
       "indexes": {
-        "notifications_user_idx": {
-          "name": "notifications_user_idx",
+        "notifications_inbox_idx": {
+          "name": "notifications_inbox_idx",
           "columns": [
             {
-              "expression": "user_id",
+              "expression": "recipient_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -300,15 +307,31 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "notifications_unread_idx": {
+          "name": "notifications_unread_idx",
+          "columns": [
+            {
+              "expression": "recipient_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"notifications\".\"read_at\" is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
-        "notifications_user_id_users_id_fk": {
-          "name": "notifications_user_id_users_id_fk",
+        "notifications_recipient_id_users_id_fk": {
+          "name": "notifications_recipient_id_users_id_fk",
           "tableFrom": "notifications",
           "tableTo": "users",
           "columnsFrom": [
-            "user_id"
+            "recipient_id"
           ],
           "columnsTo": [
             "id"
@@ -347,20 +370,24 @@
       "uniqueConstraints": {
         "notifications_event_unique": {
           "name": "notifications_event_unique",
-          "nullsNotDistinct": true,
+          "nullsNotDistinct": false,
           "columns": [
-            "user_id",
+            "recipient_id",
             "actor_id",
             "kind",
-            "post_id"
+            "subject"
           ]
         }
       },
       "policies": {},
       "checkConstraints": {
-        "notifications_kind_check": {
-          "name": "notifications_kind_check",
-          "value": "\"notifications\".\"kind\" in ('like', 'repost', 'reply', 'follow')"
+        "notifications_not_self": {
+          "name": "notifications_not_self",
+          "value": "\"notifications\".\"recipient_id\" <> \"notifications\".\"actor_id\""
+        },
+        "notifications_subject_check": {
+          "name": "notifications_subject_check",
+          "value": "(\"notifications\".\"kind\" = 'follow' AND \"notifications\".\"post_id\" IS NULL) OR (\"notifications\".\"kind\" <> 'follow' AND \"notifications\".\"post_id\" IS NOT NULL)"
         }
       },
       "isRLSEnabled": false
@@ -402,80 +429,6 @@
       },
       "indexes": {},
       "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
-    "public.post_edits": {
-      "name": "post_edits",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "uuid",
-          "primaryKey": true,
-          "notNull": true,
-          "default": "gen_random_uuid()"
-        },
-        "post_id": {
-          "name": "post_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "content": {
-          "name": "content",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "version_at": {
-          "name": "version_at",
-          "type": "timestamp (3) with time zone",
-          "primaryKey": false,
-          "notNull": true
-        }
-      },
-      "indexes": {
-        "post_edits_post_idx": {
-          "name": "post_edits_post_idx",
-          "columns": [
-            {
-              "expression": "post_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "version_at",
-              "isExpression": false,
-              "asc": false,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {
-        "post_edits_post_id_posts_id_fk": {
-          "name": "post_edits_post_id_posts_id_fk",
-          "tableFrom": "post_edits",
-          "tableTo": "posts",
-          "columnsFrom": [
-            "post_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        }
-      },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
@@ -785,22 +738,136 @@
       },
       "isRLSEnabled": false
     },
-    "public.push_settings": {
-      "name": "push_settings",
+    "public.push_deliveries": {
+      "name": "push_deliveries",
       "schema": "",
       "columns": {
+        "notification_id": {
+          "name": "notification_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subscription_id": {
+          "name": "subscription_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "attempts": {
+          "name": "attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
+        "available_at": {
+          "name": "available_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "push_deliveries_due_idx": {
+          "name": "push_deliveries_due_idx",
+          "columns": [
+            {
+              "expression": "available_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "push_deliveries_notification_id_notifications_id_fk": {
+          "name": "push_deliveries_notification_id_notifications_id_fk",
+          "tableFrom": "push_deliveries",
+          "tableTo": "notifications",
+          "columnsFrom": [
+            "notification_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "push_deliveries_subscription_id_push_subscriptions_id_fk": {
+          "name": "push_deliveries_subscription_id_push_subscriptions_id_fk",
+          "tableFrom": "push_deliveries",
+          "tableTo": "push_subscriptions",
+          "columnsFrom": [
+            "subscription_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "push_deliveries_notification_id_subscription_id_pk": {
+          "name": "push_deliveries_notification_id_subscription_id_pk",
+          "columns": [
+            "notification_id",
+            "subscription_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.push_subscriptions": {
+      "name": "push_subscriptions",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
         "user_id": {
           "name": "user_id",
           "type": "uuid",
-          "primaryKey": true,
+          "primaryKey": false,
           "notNull": true
         },
-        "prompt_dismissed": {
-          "name": "prompt_dismissed",
-          "type": "boolean",
+        "session_hash": {
+          "name": "session_hash",
+          "type": "text",
           "primaryKey": false,
-          "notNull": true,
-          "default": false
+          "notNull": true
+        },
+        "endpoint": {
+          "name": "endpoint",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "p256dh": {
+          "name": "p256dh",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "auth": {
+          "name": "auth",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
         },
         "muted_until": {
           "name": "muted_until",
@@ -816,11 +883,27 @@
           "default": false
         }
       },
-      "indexes": {},
+      "indexes": {
+        "push_subscriptions_user_idx": {
+          "name": "push_subscriptions_user_idx",
+          "columns": [
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
       "foreignKeys": {
-        "push_settings_user_id_users_id_fk": {
-          "name": "push_settings_user_id_users_id_fk",
-          "tableFrom": "push_settings",
+        "push_subscriptions_user_id_users_id_fk": {
+          "name": "push_subscriptions_user_id_users_id_fk",
+          "tableFrom": "push_subscriptions",
           "tableTo": "users",
           "columnsFrom": [
             "user_id"
@@ -830,10 +913,31 @@
           ],
           "onDelete": "cascade",
           "onUpdate": "no action"
+        },
+        "push_subscriptions_session_hash_auth_sessions_token_hash_fk": {
+          "name": "push_subscriptions_session_hash_auth_sessions_token_hash_fk",
+          "tableFrom": "push_subscriptions",
+          "tableTo": "auth_sessions",
+          "columnsFrom": [
+            "session_hash"
+          ],
+          "columnsTo": [
+            "token_hash"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
+      "uniqueConstraints": {
+        "push_subscriptions_endpoint_unique": {
+          "name": "push_subscriptions_endpoint_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "endpoint"
+          ]
+        }
+      },
       "policies": {},
       "checkConstraints": {},
       "isRLSEnabled": false
@@ -1037,7 +1141,18 @@
       "isRLSEnabled": false
     }
   },
-  "enums": {},
+  "enums": {
+    "public.notification_kind": {
+      "name": "notification_kind",
+      "schema": "public",
+      "values": [
+        "like",
+        "repost",
+        "reply",
+        "follow"
+      ]
+    }
+  },
   "schemas": {},
   "sequences": {},
   "roles": {},

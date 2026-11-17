@@ -58,12 +58,13 @@ export const postSelection = (viewerId: string | null) => ({
   ...friendLikeSelection(viewerId),
   ...repostSelection(viewerId),
   ...postFields,
-  // Every reply below the post, nested ones included.
   replies: sql<number>`(
-    with recursive descendants as (
-      select c.id from posts c where c.parent_id = ${posts.id}
+    with recursive descendants(id) as (
+      select reply.id from posts reply
+      where reply.parent_id = ${posts}.${sql.identifier(posts.id.name)}
       union all
-      select r.id from posts r join descendants d on r.parent_id = d.id
+      select reply.id from posts reply
+      join descendants on reply.parent_id = descendants.id
     )
     select count(*)::int from descendants
   )`,

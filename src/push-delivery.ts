@@ -1,0 +1,152 @@
+import * as webpush from "web-push";
+import { and, eq, lte } from "drizzle-orm";
+import { db } from "./db/index.ts";
+import {
+  authSessions,
+  notifications,
+  posts,
+  pushDeliveries,
+  pushSubscriptions,
+  users,
+} from "./db/schema.ts";
+import { env } from "./config.ts";
+import { userSelection } from "./user-data.ts";
+import { notificationPreview } from "./notification-content.ts";
+
+const descriptions = {
+  like: "liked your post",
+  repost: "reposted your post",
+  reply: "replied to your post",
+  follow: "followed you",
+};
+
+export async function flushPushDeliveries(send = webpush.sendNotification) {
+  const vapidDetails = env.PUSH;
+  if (!vapidDetails) return;
+  // Bounded batches and SKIP LOCKED let multiple API replicas drain safely.
+  for (let i = 0; i < 25; i++) {
+    const found = await db.transaction(async (tx) => {
+      const [job] = await tx
+        .select()
+        .from(pushDeliveries)
+        .where(lte(pushDeliveries.availableAt, new Date()))
+        .orderBy(pushDeliveries.availableAt)
+        .limit(1)
+        .for("update", { skipLocked: true });
+      if (!job) return false;
+      const where = and(
+        eq(pushDeliveries.notificationId, job.notificationId),
+        eq(pushDeliveries.subscriptionId, job.subscriptionId),
+      );
+      const [event] = await tx
+        .select({
+          notification: notifications,
+          subscription: pushSubscriptions,
+          actor: userSelection,
+          content: posts.content,
+          expiresAt: authSessions.expiresAt,
+        })
+        .from(notifications)
+        .innerJoin(users, eq(users.id, notifications.actorId))
+        .leftJoin(posts, eq(posts.id, notifications.postId))
+        .innerJoin(
+          pushSubscriptions,
+          eq(pushSubscriptions.id, job.subscriptionId),
+        )
+        .innerJoin(
+          authSessions,
+          eq(authSessions.tokenHash, pushSubscriptions.sessionHash),
+        )
+        .where(eq(notifications.id, job.notificationId));
+      if (
+        !event ||
+        event.notification.readAt ||
+        event.subscription.mutedForever ||
+        (event.subscription.mutedUntil &&
+          event.subscription.mutedUntil > new Date()) ||
+        event.expiresAt <= new Date() ||
+        event.notification.recipientId !== event.subscription.userId
+      ) {
+        await tx.delete(pushDeliveries).where(where);
+        return true;
+      }
+      const { notification, subscription, actor } = event;
+      const summary = `${actor.displayName || actor.handle} ${descriptions[notification.kind]}`;
+      const preview =
+        notification.kind === "reply" && event.content
+          ? notificationPreview(event.content)
+          : null;
+      try {
+        await send(
+          {
+            endpoint: subscription.endpoint,
+            keys: { p256dh: subscription.p256dh, auth: subscription.auth },
+          },
+          JSON.stringify({
+            id: notification.id,
+            title: "ysocial",
+            body: preview ? `${summary}\n${preview}` : summary,
+            icon: actor.avatarUrl ?? "/favicon.png",
+            url: notification.postId
+              ? `/posts/${notification.postId}`
+              : `/@${actor.handle}`,
+          }),
+          { vapidDetails, TTL: 3600, timeout: 10_000, urgency: "normal" },
+        );
+      } catch (error) {
+        if (
+          error instanceof webpush.WebPushError &&
+          [404, 410].includes(error.statusCode)
+        ) {
+          await tx
+            .delete(pushSubscriptions)
+            .where(eq(pushSubscriptions.id, subscription.id));
+          return true;
+        }
+        if (job.attempts < 5) {
+          await tx
+            .update(pushDeliveries)
+            .set({
+              attempts: job.attempts + 1,
+              availableAt: new Date(
+                Date.now() + Math.min(3600_000, 30_000 * 2 ** job.attempts),
+              ),
+            })
+            .where(where);
+          console.warn({
+            event: "push_delivery_retry",
+            notificationId: notification.id,
+          });
+          return true;
+        }
+        console.error({
+          event: "push_delivery_failed",
+          notificationId: notification.id,
+        });
+      }
+      await tx.delete(pushDeliveries).where(where);
+      return true;
+    });
+    if (!found) break;
+  }
+}
+
+export function startPushDelivery() {
+  if (!env.PUSH) return () => {};
+  let running = false;
+  const drain = async () => {
+    if (running) return;
+    running = true;
+    try {
+      await flushPushDeliveries();
+    } catch {
+      console.error({ event: "push_worker_unavailable" });
+    } finally {
+      running = false;
+    }
+  };
+  void drain();
+  const timer = setInterval(() => void drain(), 5000);
+  timer.unref();
+  return () => clearInterval(timer);
+}

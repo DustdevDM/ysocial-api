@@ -2,8 +2,9 @@ import type { BannerCrop } from "../storage/banner-crop.ts";
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
-  boolean,
   check,
+  boolean,
+  pgEnum,
   integer,
   jsonb,
   index,
@@ -22,6 +23,7 @@ export const users = pgTable(
     handle: text().notNull().unique("users_handle_unique"),
     displayName: text("display_name").notNull().default(""),
     bio: text().notNull().default(""),
+    notificationPromptDismissed: boolean("notification_prompt_dismissed").notNull().default(false),
     avatarKey: text("avatar_key"),
     bannerKey: text("banner_key"),
     bannerCrop: jsonb("banner_crop").$type<BannerCrop>(),
@@ -194,50 +196,6 @@ export const userFollows = pgTable(
   ],
 );
 
-// Inbox entries for likes, reposts, replies and follows. `postId` is the post
-// that was liked/reposted, or the new reply.
-export const notifications = pgTable(
-  "notifications",
-  {
-    id: uuid().defaultRandom().primaryKey(),
-    userId: uuid("user_id")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
-    actorId: uuid("actor_id")
-      .notNull()
-      .references(() => users.id, { onDelete: "cascade" }),
-    kind: text().notNull(),
-    postId: uuid("post_id").references(() => posts.id, { onDelete: "cascade" }),
-    createdAt: timestamp("created_at", { withTimezone: true, precision: 3 })
-      .notNull()
-      .defaultNow(),
-    readAt: timestamp("read_at", { withTimezone: true, precision: 3 }),
-  },
-  (table) => [
-    index("notifications_user_idx").on(
-      table.userId,
-      table.createdAt.desc(),
-      table.id.desc(),
-    ),
-    unique("notifications_event_unique")
-      .on(table.userId, table.actorId, table.kind, table.postId)
-      .nullsNotDistinct(),
-    check(
-      "notifications_kind_check",
-      sql`${table.kind} in ('like', 'repost', 'reply', 'follow')`,
-    ),
-  ],
-);
-
-export const pushSettings = pgTable("push_settings", {
-  userId: uuid("user_id")
-    .primaryKey()
-    .references(() => users.id, { onDelete: "cascade" }),
-  promptDismissed: boolean("prompt_dismissed").notNull().default(false),
-  mutedUntil: timestamp("muted_until", { withTimezone: true }),
-  mutedForever: boolean("muted_forever").notNull().default(false),
-});
-
 // Durable outbox for replacements, removals, and unfinished uploads.
 export const mediaDeletions = pgTable(
   "media_deletions",
@@ -249,4 +207,94 @@ export const mediaDeletions = pgTable(
     attempts: integer().notNull().default(0),
   },
   (table) => [index("media_deletions_due_idx").on(table.availableAt)],
+);
+
+export const notificationKind = pgEnum("notification_kind", [
+  "like",
+  "repost",
+  "reply",
+  "follow",
+]);
+export const notifications = pgTable(
+  "notifications",
+  {
+    id: uuid().defaultRandom().primaryKey(),
+    recipientId: uuid("recipient_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    actorId: uuid("actor_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    kind: notificationKind().notNull(),
+    postId: uuid("post_id").references(() => posts.id, { onDelete: "cascade" }),
+    // Stable event identity also deduplicates an unlike/re-like or unfollow/re-follow.
+    subject: text().notNull(),
+    readAt: timestamp("read_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true, precision: 3 })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    unique("notifications_event_unique").on(
+      table.recipientId,
+      table.actorId,
+      table.kind,
+      table.subject,
+    ),
+    index("notifications_inbox_idx").on(
+      table.recipientId,
+      table.createdAt.desc(),
+      table.id.desc(),
+    ),
+    index("notifications_unread_idx")
+      .on(table.recipientId)
+      .where(sql`${table.readAt} is null`),
+    check(
+      "notifications_not_self",
+      sql`${table.recipientId} <> ${table.actorId}`,
+    ),
+    check(
+      "notifications_subject_check",
+      sql`(${table.kind} = 'follow' AND ${table.postId} IS NULL) OR (${table.kind} <> 'follow' AND ${table.postId} IS NOT NULL)`,
+    ),
+  ],
+);
+
+export const pushSubscriptions = pgTable(
+  "push_subscriptions",
+  {
+    id: uuid().defaultRandom().primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    sessionHash: text("session_hash")
+      .notNull()
+      .references(() => authSessions.tokenHash, { onDelete: "cascade" }),
+    endpoint: text().notNull().unique(),
+    p256dh: text().notNull(),
+    auth: text().notNull(),
+    mutedUntil: timestamp("muted_until", { withTimezone: true }),
+    mutedForever: boolean("muted_forever").notNull().default(false),
+  },
+  (table) => [index("push_subscriptions_user_idx").on(table.userId)],
+);
+
+export const pushDeliveries = pgTable(
+  "push_deliveries",
+  {
+    notificationId: uuid("notification_id")
+      .notNull()
+      .references(() => notifications.id, { onDelete: "cascade" }),
+    subscriptionId: uuid("subscription_id")
+      .notNull()
+      .references(() => pushSubscriptions.id, { onDelete: "cascade" }),
+    attempts: integer().notNull().default(0),
+    availableAt: timestamp("available_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.notificationId, table.subscriptionId] }),
+    index("push_deliveries_due_idx").on(table.availableAt),
+  ],
 );

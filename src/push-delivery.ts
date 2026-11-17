@@ -23,13 +23,17 @@ const descriptions = {
 export async function flushPushDeliveries(send = webpush.sendNotification) {
   const vapidDetails = env.PUSH;
   if (!vapidDetails) return;
+  // available_at is set by the database in microseconds while Date truncates
+  // to milliseconds, so a row made due in the same millisecond would look not
+  // yet due and be skipped.
+  const dueBy = new Date(Date.now() + 1);
   // Bounded batches and SKIP LOCKED let multiple API replicas drain safely.
   for (let i = 0; i < 25; i++) {
     const found = await db.transaction(async (tx) => {
       const [job] = await tx
         .select()
         .from(pushDeliveries)
-        .where(lte(pushDeliveries.availableAt, new Date()))
+        .where(lte(pushDeliveries.availableAt, dueBy))
         .orderBy(pushDeliveries.availableAt)
         .limit(1)
         .for("update", { skipLocked: true });

@@ -6,12 +6,13 @@ import {
   repostSelection,
 } from "./post-data.ts";
 import { Router, type Request } from "express";
-import { and, desc, eq, isNull, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, isNull, lt, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db/index.ts";
 import { postLikes, postReposts, posts, users } from "./db/schema.ts";
 import { requireUser, readViewerId } from "./auth/request.ts";
 import { AuthError } from "./auth/provider.ts";
+import { userSelection } from "./user-data.ts";
 
 const router = Router();
 const contentSchema = z.strictObject({
@@ -167,6 +168,34 @@ router.get("/:id", async (req, res) => {
   });
 });
 router.get("/:id/replies", listPosts);
+router.get("/:id/activity", async (req, res) => {
+  const query = z
+    .object({
+      type: z.enum(["likes", "reposts"]),
+      cursor: z.uuid().optional(),
+    })
+    .safeParse(req.query);
+  if (!query.success) throw new AuthError(400, "invalid_activity_query");
+  await findPost(req.params.id);
+  const activity = query.data.type === "likes" ? postLikes : postReposts;
+  const rows = await db
+    .select(userSelection)
+    .from(activity)
+    .innerJoin(users, eq(users.id, activity.userId))
+    .where(
+      and(
+        eq(activity.postId, req.params.id),
+        query.data.cursor ? gt(activity.userId, query.data.cursor) : undefined,
+      ),
+    )
+    .orderBy(asc(activity.userId))
+    .limit(51);
+  const page = rows.slice(0, 50);
+  res.json({
+    users: page,
+    nextCursor: rows.length > 50 ? (page.at(-1)?.id ?? null) : null,
+  });
+});
 router.post("/:id/replies", async (req, res) => {
   const user = await requireUser(req);
   const parsed = createSchema.safeParse(req.body);

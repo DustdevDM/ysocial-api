@@ -1,4 +1,4 @@
-// A topic is written as #name inside a top-level post. Names start with a
+// A topic is written as #name inside a post or reply. Names start with a
 // letter, continue with letters, digits or underscores, and are case-insensitive.
 // The same grammar lives in the web client (src/lib/topics.ts) and in the SQL
 // backfill of drizzle/0017_*.sql; keep the three in step.

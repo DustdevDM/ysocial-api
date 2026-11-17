@@ -57,16 +57,17 @@ test("topic grammar: the JS parser and the migration backfill agree", async () =
       );
       ids.push(post.id);
     }
-    // A reply with a hashtag is plain text, not a topic.
+    // The reply migration indexes replies that predate topic support.
     await pool.query("INSERT INTO posts (author_id, parent_id, content) VALUES ($1, $2, '#reply')", [user.id, ids[0]]);
     await pool.query("DELETE FROM post_topics");
     await pool.query(backfill);
+    await pool.query(await readFile(`${folder}/0020_reply_topics.sql`, "utf8"));
     for (const [index, [text, expected]] of CASES.entries()) {
       const { rows } = await pool.query("SELECT topic FROM post_topics WHERE post_id = $1", [ids[index]]);
       assert.deepEqual(rows.map((row) => row.topic).sort(), [...expected].sort(), `backfill ${JSON.stringify(text)}`);
     }
     const { rows: replies } = await pool.query("SELECT 1 FROM post_topics WHERE topic = 'reply'");
-    assert.equal(replies.length, 0);
+    assert.equal(replies.length, 1);
   } finally {
     await pool?.end();
     await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
@@ -150,11 +151,11 @@ test("topics: tagging, feeds, trending and suggestions", async () => {
     ]);
     assert.equal((await get("/api/topics")).windowHours, 24);
 
-    // Replies never carry topics, even when they contain a hashtag.
-    const reply = await create("agreed #launch #newthing", first.id);
-    assert.deepEqual(reply.topics, []);
+    const reply = await create("agreed #launch", first.id);
+    assert.deepEqual(reply.topics, ["launch"]);
+    assert.ok((await get("/api/posts")).posts.every((post) => post.id !== reply.id));
     assert.deepEqual(await trending(), [
-      { name: "launch", count: 2 },
+      { name: "launch", count: 3 },
       { name: "party", count: 1 },
     ]);
 
@@ -162,24 +163,24 @@ test("topics: tagging, feeds, trending and suggestions", async () => {
     const old = await create("Old news #ancient #launch");
     await pool.query("UPDATE posts SET created_at = now() - interval '25 hours' WHERE id = $1", [old.id]);
     assert.deepEqual(await trending(), [
-      { name: "launch", count: 2 },
+      { name: "launch", count: 3 },
       { name: "party", count: 1 },
     ]);
-    assert.deepEqual((await get("/api/topics/launch")).topic, { name: "launch", posts: 3 });
-    assert.deepEqual((await get("/api/topics/LAUNCH")).topic, { name: "launch", posts: 3 });
+    assert.deepEqual((await get("/api/topics/launch")).topic, { name: "launch", posts: 4 });
+    assert.deepEqual((await get("/api/topics/LAUNCH")).topic, { name: "launch", posts: 4 });
     assert.deepEqual((await get("/api/topics/unused")).topic, { name: "unused", posts: 0 });
 
     // Only the three most used topics are returned, ties broken by recency.
     await create("#alpha #beta");
     const top = await trending();
     assert.equal(top.length, 3);
-    assert.deepEqual(top[0], { name: "launch", count: 2 });
+    assert.deepEqual(top[0], { name: "launch", count: 3 });
     assert.deepEqual(top.slice(1).map((topic) => topic.count), [1, 1]);
 
-    // The topic feed lists top-level posts with the topic, newest first.
+    // The topic feed includes posts and replies, newest first.
     const feed = await get("/api/posts?topic=launch");
-    assert.deepEqual(feed.posts.map((post) => post.id), [second.id, first.id, old.id]);
-    assert.equal((await get("/api/posts?topic=Launch")).posts.length, 3);
+    assert.deepEqual(feed.posts.map((post) => post.id), [reply.id, second.id, first.id, old.id]);
+    assert.equal((await get("/api/posts?topic=Launch")).posts.length, 4);
     assert.equal((await get("/api/posts?topic=unused")).posts.length, 0);
     assert.ok(feed.posts.every((post) => post.topics.includes("launch")));
     for (let index = 0; index < 22; index++) await create("paged #paging");
@@ -192,8 +193,8 @@ test("topics: tagging, feeds, trending and suggestions", async () => {
     assert.equal(new Set([...page.posts, ...rest.posts].map((post) => post.id)).size, 22);
 
     // Suggestions are existing topics by prefix, most used first.
-    assert.deepEqual((await get("/api/topics?prefix=la")).topics, [{ name: "launch", count: 3 }]);
-    assert.deepEqual((await get("/api/topics?prefix=LA")).topics, [{ name: "launch", count: 3 }]);
+    assert.deepEqual((await get("/api/topics?prefix=la")).topics, [{ name: "launch", count: 4 }]);
+    assert.deepEqual((await get("/api/topics?prefix=LA")).topics, [{ name: "launch", count: 4 }]);
     assert.deepEqual((await get("/api/topics?prefix=zzz")).topics, []);
     assert.deepEqual((await get("/api/topics?prefix=pa")).topics.map((topic) => topic.name), ["paging", "party"]);
     // "_" is not a wildcard.
@@ -216,13 +217,18 @@ test("topics: tagging, feeds, trending and suggestions", async () => {
 
     // Deleting a post (and its topics) lowers the counts.
     assert.equal((await request(`/api/posts/${second.id}`, "DELETE")).status, 204);
-    assert.deepEqual((await get("/api/topics/launch")).topic, { name: "launch", posts: 1 });
-    assert.equal((await get("/api/topics?prefix=launch")).topics[0].count, 1);
+    assert.deepEqual((await get("/api/topics/launch")).topic, { name: "launch", posts: 2 });
+    assert.equal((await get("/api/topics?prefix=launch")).topics[0].count, 2);
 
     // Replies in a thread and profile posts expose topics too.
     const profile = await get("/api/profiles/topic_author");
     assert.ok(profile.posts.every((post) => Array.isArray(post.topics)));
-    assert.deepEqual((await get(`/api/posts/${first.id}/thread`)).replies[0].topics, []);
+    assert.deepEqual((await get(`/api/posts/${first.id}/thread`)).replies[0].topics, ["launch"]);
+    const replyEdit = await request(`/api/posts/${reply.id}`, "PATCH", { content: "Edited #newthing" });
+    assert.equal(replyEdit.status, 200);
+    assert.deepEqual((await replyEdit.json()).post.topics, ["newthing"]);
+    assert.deepEqual((await get("/api/posts?topic=newthing")).posts.map((post) => post.id), [reply.id]);
+    assert.deepEqual((await get("/api/posts?topic=launch")).posts.map((post) => post.id), [old.id]);
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));
     await pool?.end();

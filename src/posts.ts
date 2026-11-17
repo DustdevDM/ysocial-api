@@ -20,11 +20,19 @@ import {
 } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db/index.ts";
-import { postEdits, postLikes, postReposts, posts, users } from "./db/schema.ts";
+import {
+  postEdits,
+  postLikes,
+  postReposts,
+  postTopics,
+  posts,
+  users,
+} from "./db/schema.ts";
 import { requireUser, readViewerId } from "./auth/request.ts";
 import { AuthError } from "./auth/provider.ts";
 import { userSelection } from "./user-data.ts";
 import { recordNotification } from "./notification-events.ts";
+import { parseTopicName, syncPostTopics } from "./topics.ts";
 
 import { syncMentions } from "./mentions.ts";
 
@@ -89,6 +97,7 @@ async function createPost({
       .returning({ id: posts.id });
     if (saved) {
       await syncMentions(tx, saved.id, userId, input.content);
+      if (!parentId) await syncPostTopics(tx, saved.id, input.content);
       if (parentAuthor)
         await recordNotification(tx, {
           recipientId: parentAuthor,
@@ -129,6 +138,11 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
     typeof req.params.id === "string" ? req.params.id : undefined;
   if (parentId) await findPost(parentId);
   const viewerId = await readViewerId(req);
+  // Topics only tag top-level posts, so a topic filter is a top-level feed.
+  const topic =
+    !parentId && req.query.topic !== undefined
+      ? parseTopicName(req.query.topic)
+      : undefined;
   let cursor: z.infer<typeof cursorSchema> | undefined;
   if (req.query.cursor !== undefined) {
     try {
@@ -148,6 +162,15 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
     .where(
       and(
         parentId ? eq(posts.parentId, parentId) : isNull(posts.parentId),
+        topic
+          ? inArray(
+              posts.id,
+              db
+                .select({ id: postTopics.postId })
+                .from(postTopics)
+                .where(eq(postTopics.topic, topic)),
+            )
+          : undefined,
         cursor
           ? or(
               lt(posts.createdAt, new Date(cursor.createdAt)),
@@ -415,6 +438,7 @@ router.patch("/:id", async (req, res) => {
     const [existing] = await tx
       .select({
         authorId: posts.authorId,
+        parentId: posts.parentId,
         content: posts.content,
         createdAt: posts.createdAt,
         editedAt: posts.editedAt,
@@ -436,6 +460,8 @@ router.patch("/:id", async (req, res) => {
       )
       .returning(postFields);
     if (!saved) throw new AuthError(409, "edit_window_expired");
+    if (!existing.parentId)
+      await syncPostTopics(tx, req.params.id, parsed.data.content);
     if (existing.content !== parsed.data.content)
       await tx.insert(postEdits).values({
         postId: req.params.id,

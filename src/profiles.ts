@@ -24,6 +24,20 @@ router.use((_req, res, next) => {
   res.set("Cache-Control", "no-store");
   next();
 });
+router.get("/suggestions", async (req, res) => {
+  const query = z.string().regex(/^[a-z0-9_]{0,32}$/i).safeParse(req.query.q);
+  if (!query.success) throw new AuthError(400, "invalid_handle");
+  const term = query.data.toLowerCase();
+  if (!term) {
+    res.json({ users: [] });
+    return;
+  }
+  const matches = await db.select(userSelection).from(users)
+    .where(sql`strpos(${users.handle}, ${term}) > 0`)
+    .orderBy(sql`case when ${users.handle} = ${term} then 0 when strpos(${users.handle}, ${term}) = 1 then 1 else 2 end`, users.handle)
+    .limit(3);
+  res.json({ users: matches });
+});
 router.patch("/me", async (req, res) => {
   const viewer = await requireUser(req);
   const input = z

@@ -93,6 +93,10 @@ export async function replaceProfileMedia(userId: string, media: ProfileMedia) {
 export async function flushMediaDeletions(key?: string, database = db) {
   if (!avatarStorage) return;
   const { client, bucket } = avatarStorage;
+  // available_at defaults to the database's now() in microseconds, while Date
+  // truncates to milliseconds: a row queued in the same millisecond would
+  // otherwise look not yet due and be skipped.
+  const dueBy = new Date(Date.now() + 1);
   try {
     for (let processed = 0; processed < 25; processed++) {
       const found = await database.transaction(async (tx) => {
@@ -102,7 +106,7 @@ export async function flushMediaDeletions(key?: string, database = db) {
           .from(mediaDeletions)
           .where(
             and(
-              lte(mediaDeletions.availableAt, new Date()),
+              lte(mediaDeletions.availableAt, dueBy),
               key ? eq(mediaDeletions.key, key) : undefined,
             ),
           )

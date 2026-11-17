@@ -68,6 +68,9 @@ test("mentions resolve, notify, edit, and deduplicate through the API", async ()
     await pool.query("INSERT INTO users (handle) VALUES ('tag_tom'), ('tag_tina'), ('other_tag'), ('tag_tim')");
     const anonymous = await fetch(base + '/api/profiles/suggestions?q=tag', { headers: { Origin: env.APP_ORIGIN } });
     assert.equal(anonymous.status, 401);
+    // Browsers send no Origin header on same-origin GETs.
+    const browserGet = await fetch(base + '/api/profiles/suggestions?q=tag', { headers: { Cookie: `session=${token}` } });
+    assert.equal(browserGet.status, 200);
     const suggestions = await get('/api/profiles/suggestions?q=TAG_T');
     assert.equal(suggestions.users.length, 3);
     assert.deepEqual(suggestions.users.map((user) => user.handle), ['tag_target', 'tag_tim', 'tag_tina']);

@@ -166,22 +166,36 @@
     {
       "idx": 23,
       "version": "7",
-      "when": 1795026317236,
-      "tag": "0023_lame_leopardon",
+      "when": 1795009335268,
+      "tag": "0023_reposts_and_quotes",
       "breakpoints": true
     },
     {
       "idx": 24,
       "version": "7",
-      "when": 1795026317237,
-      "tag": "0024_voice_draft_expiry",
+      "when": 1795028932458,
+      "tag": "0024_avatar_history",
       "breakpoints": true
     },
     {
       "idx": 25,
       "version": "7",
+      "when": 1795028932459,
+      "tag": "0025_post_voice",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1795028932460,
+      "tag": "0026_voice_draft_expiry",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
       "when": 1795039681555,
-      "tag": "0025_voice_jobs",
+      "tag": "0027_voice_jobs",
       "breakpoints": true
     }
   ]

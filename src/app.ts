@@ -7,6 +7,8 @@ import { startVoiceJobs } from "./storage/voice-jobs.ts";
 import { checkAvatarStorage } from "./storage/r2.ts";
 import profiles from "./profiles.ts";
 import posts from "./posts.ts";
+import live from "./live.ts";
+import { startLiveEvents } from "./live-events.ts";
 import notifications from "./notifications.ts";
 import topics from "./topics.ts";
 import { startPushDelivery } from "./push-delivery.ts";
@@ -42,6 +44,7 @@ app.post("/webhooks/cns", (_req, res) => {
 app.use(express.json({ limit: "16kb" }));
 app.use("/auth", auth);
 app.use("/api/posts", posts);
+app.use("/api/live", live);
 app.use("/api/notifications", notifications);
 app.use("/api/topics", topics);
 app.use("/api/profiles", profiles);
@@ -93,6 +96,7 @@ if (import.meta.main) {
   let stopMediaCleanup = () => {};
   let stopVoiceJobs = () => {};
   let stopPushDelivery = () => {};
+  let stopLiveEvents = () => {};
   const server = app.listen(env.PORT, () =>
     console.info(`API listening on port ${env.PORT}`),
   );
@@ -107,6 +111,7 @@ if (import.meta.main) {
       stopMediaCleanup();
       stopPushDelivery();
       stopVoiceJobs();
+      stopLiveEvents();
       setTimeout(() => {
         server.close(() => { void pool.end(); });
         server.closeIdleConnections();
@@ -151,6 +156,7 @@ if (import.meta.main) {
     stopMediaCleanup = startMediaCleanup();
     stopVoiceJobs = startVoiceJobs();
     stopPushDelivery = startPushDelivery();
+    stopLiveEvents = startLiveEvents();
     startupReady = true;
   } catch (error) {
     if (!shutdown.signal.aborted) {

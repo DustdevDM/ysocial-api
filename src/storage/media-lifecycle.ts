@@ -1,9 +1,9 @@
 import type { PoolClient } from "pg";
 import { sweepUnusedMedia } from "./media-sweep.ts";
 import { DeleteObjectCommand } from "@aws-sdk/client-s3";
-import { and, eq, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, lte, or, sql } from "drizzle-orm";
 import { createDatabase, db, pool } from "../db/index.ts";
-import { mediaDeletions, posts, users } from "../db/schema.ts";
+import { avatarHistory, mediaDeletions, posts, users } from "../db/schema.ts";
 import { AuthError } from "../auth/provider.ts";
 import type { BannerCrop } from "./banner-crop.ts";
 import { avatarStorage, putAvatar } from "./r2.ts";
@@ -33,64 +33,137 @@ export async function stageMediaUpload(
   return pending.availableAt;
 }
 
+export const recentAvatarLimit = 5;
+
 type ProfileMedia =
-  | { kind: "avatar"; key: string }
+  | { kind: "avatar"; key: string; fromRecent?: boolean }
   | {
       kind: "banner";
       key: string | null;
       url: string | null;
       crop: BannerCrop | null;
     };
+
+async function queueDeletion(tx: Pick<typeof db, "insert">, key: string) {
+  await tx
+    .insert(mediaDeletions)
+    .values({ key })
+    .onConflictDoUpdate({
+      target: mediaDeletions.key,
+      set: { availableAt: new Date() },
+    });
+}
+
 export async function replaceProfileMedia(userId: string, media: ProfileMedia) {
-  let previous: string | null = null;
+  let removed: string[] = [];
   try {
-    previous = await db.transaction(async (tx) => {
+    removed = await db.transaction(async (tx) => {
       const [user] = await tx
         .select({ avatarKey: users.avatarKey, bannerKey: users.bannerKey })
         .from(users)
         .where(eq(users.id, userId))
         .for("update");
       if (!user) throw new AuthError(401, "sign_in_required");
-      const previous =
-        media.kind === "avatar" ? user.avatarKey : user.bannerKey;
+      if (media.kind === "avatar") {
+        if (media.fromRecent) {
+          const [recent] = await tx
+            .select({ key: avatarHistory.key })
+            .from(avatarHistory)
+            .where(
+              and(
+                eq(avatarHistory.key, media.key),
+                eq(avatarHistory.userId, userId),
+              ),
+            );
+          if (!recent) throw new AuthError(404, "avatar_not_found");
+        }
+        await tx
+          .update(users)
+          .set({ avatarKey: media.key, updatedAt: new Date() })
+          .where(eq(users.id, userId));
+        if (user.avatarKey && user.avatarKey !== media.key)
+          await tx
+            .insert(avatarHistory)
+            .values({
+              key: user.avatarKey,
+              userId,
+              usedAt: new Date(Date.now() - 1),
+            })
+            .onConflictDoNothing();
+        await tx
+          .insert(avatarHistory)
+          .values({ key: media.key, userId })
+          .onConflictDoUpdate({
+            target: avatarHistory.key,
+            set: { usedAt: new Date() },
+          });
+        await tx
+          .delete(mediaDeletions)
+          .where(eq(mediaDeletions.key, media.key));
+        const stale = (
+          await tx
+            .select({ key: avatarHistory.key })
+            .from(avatarHistory)
+            .where(eq(avatarHistory.userId, userId))
+            .orderBy(desc(avatarHistory.usedAt))
+            .offset(recentAvatarLimit + 1)
+        ).map((row) => row.key);
+        for (const key of stale) {
+          await tx.delete(avatarHistory).where(eq(avatarHistory.key, key));
+          await queueDeletion(tx, key);
+        }
+        return stale;
+      }
       await tx
         .update(users)
-        .set(
-          media.kind === "avatar"
-            ? { avatarKey: media.key, updatedAt: new Date() }
-            : {
-                bannerKey: media.key,
-                bannerExternalUrl: media.url,
-                bannerCrop: media.crop,
-                updatedAt: new Date(),
-              },
-        )
+        .set({
+          bannerKey: media.key,
+          bannerExternalUrl: media.url,
+          bannerCrop: media.crop,
+          updatedAt: new Date(),
+        })
         .where(eq(users.id, userId));
       if (media.key)
         await tx
           .delete(mediaDeletions)
           .where(eq(mediaDeletions.key, media.key));
-      if (previous && previous !== media.key)
-        await tx
-          .insert(mediaDeletions)
-          .values({ key: previous })
-          .onConflictDoUpdate({
-            target: mediaDeletions.key,
-            set: { availableAt: new Date() },
-          });
-      return previous;
+      if (user.bannerKey && user.bannerKey !== media.key) {
+        await queueDeletion(tx, user.bannerKey);
+        return [user.bannerKey];
+      }
+      return [];
     });
   } catch (error) {
     // An unattached upload is already in the outbox; make it immediately due.
-    if (media.key)
+    if (media.key && !(media.kind === "avatar" && media.fromRecent)) {
       await db
         .update(mediaDeletions)
         .set({ availableAt: new Date() })
         .where(eq(mediaDeletions.key, media.key));
-    if (media.key) await flushMediaDeletions(media.key);
+      await flushMediaDeletions(media.key);
+    }
     throw error;
   }
-  if (previous && previous !== media.key) await flushMediaDeletions(previous);
+  for (const key of removed) await flushMediaDeletions(key);
+}
+
+export async function removeRecentAvatar(userId: string, key: string) {
+  await db.transaction(async (tx) => {
+    const [user] = await tx
+      .select({ avatarKey: users.avatarKey })
+      .from(users)
+      .where(eq(users.id, userId))
+      .for("update");
+    if (!user) throw new AuthError(401, "sign_in_required");
+    if (user.avatarKey === key) throw new AuthError(409, "avatar_in_use");
+    const deleted = await tx
+      .delete(avatarHistory)
+      .where(and(eq(avatarHistory.key, key), eq(avatarHistory.userId, userId)))
+      .returning({ key: avatarHistory.key });
+    if (!deleted.length) throw new AuthError(404, "avatar_not_found");
+    await queueDeletion(tx, key);
+  });
+  await flushMediaDeletions(key);
 }
 
 export async function flushMediaDeletions(key?: string, database = db) {
@@ -118,9 +191,16 @@ export async function flushMediaDeletions(key?: string, database = db) {
           .from(users)
           .where(or(eq(users.avatarKey, job.key), eq(users.bannerKey, job.key)))
           .limit(1);
+        const [kept] = active
+          ? []
+          : await tx
+              .select({ key: avatarHistory.key })
+              .from(avatarHistory)
+              .where(eq(avatarHistory.key, job.key))
+              .limit(1);
         const [voicePost] = job.key.startsWith("voices/") ? await tx.select({ id: posts.id }).from(posts)
           .where(eq(sql`${posts.voice}->>'key'`, job.key)).limit(1) : [];
-        if (!active && !voicePost) {
+        if (!active && !kept && !voicePost) {
           try {
             // Deleting an already absent key succeeds, including after a crash.
             await client.send(

@@ -5,8 +5,12 @@ import {
   reactionSelection,
   repostSelection,
   pollSelection,
+  mutualFollowSql,
+  repostVisibleSql,
 } from "./post-data.ts";
+import { homeFeed } from "./feed-entries.ts";
 import { Router, type Request } from "express";
+import { alias } from "drizzle-orm/pg-core";
 import {
   and,
   asc,
@@ -26,6 +30,8 @@ import {
   postEdits,
   pollVotes,
   postLikes,
+  notifications,
+  postMentions,
   postReposts,
   postTopics,
   posts,
@@ -37,6 +43,8 @@ import { AuthError } from "./auth/provider.ts";
 import { userSelection } from "./user-data.ts";
 import { recordNotification } from "./notification-events.ts";
 import { parseTopicName, syncPostTopics } from "./topics.ts";
+import { extractTopics } from "./topics-text.ts";
+import { affectedPostIds, publishLiveChange, publishLivePost } from "./live-events.ts";
 
 import { syncMentions } from "./mentions.ts";
 import { readGifSelection } from "./storage/klipy.ts";
@@ -66,6 +74,8 @@ const createSchema = contentSchema
     gifToken: z.string().min(1).max(4096).optional(),
     voiceToken: z.string().min(1).max(4096).optional(),
     poll: pollDefinitionSchema.optional(),
+    // Makes this a quote post: a new top-level post that embeds the quoted one.
+    quotedPostId: z.uuid().optional(),
   })
   .refine(({ content, gifToken, poll, voiceToken }) => Boolean(content || gifToken || poll || voiceToken));
 const cursorSchema = z.strictObject({
@@ -85,10 +95,12 @@ async function createPost({
   userId,
   input,
   parentId = null,
+  quotedPostId = null,
 }: {
   userId: string;
   input: z.infer<typeof createSchema>;
   parentId?: string | null;
+  quotedPostId?: string | null;
 }) {
   const selection = input.gifToken ? readGifSelection(input.gifToken, userId) : null;
   const gif = selection?.gif ?? null;
@@ -108,10 +120,22 @@ async function createPost({
       if (!parent) throw new AuthError(404, "post_not_found");
       parentAuthor = parent.authorId;
     }
+    let quotedAuthor: string | undefined;
+    // A retried quote may outlive its original; then only the saved copy can answer.
+    let quotedGone = false;
+    if (quotedPostId) {
+      const [quoted] = await tx
+        .select({ id: posts.id, authorId: posts.authorId })
+        .from(posts)
+        .where(eq(posts.id, quotedPostId))
+        .for("key share");
+      if (quoted) quotedAuthor = quoted.authorId;
+      else quotedGone = true;
+    }
     // An expired selection can confirm an earlier successful write by client ID.
     const expired = Boolean((selection && selection.expires < Date.now()) ||
       (voiceSelection && (voiceSelection.expires < Date.now() || !pendingVoice || pendingVoice.availableAt.getTime() <= Date.now())));
-    const [saved] = expired
+    const [saved] = expired || quotedGone
       ? []
       : await tx
           .insert(posts)
@@ -123,6 +147,8 @@ async function createPost({
             voice,
             poll: input.poll,
             parentId,
+            quotedPostId,
+            isQuote: quotedPostId !== null,
           })
           .onConflictDoNothing({ target: posts.id })
           .returning({ id: posts.id });
@@ -130,6 +156,13 @@ async function createPost({
       if (voice) await tx.delete(mediaDeletions).where(eq(mediaDeletions.key, voice.key));
       await syncMentions(tx, saved.id, userId, input.content);
       await syncPostTopics(tx, saved.id, input.content);
+      await publishLivePost(tx, {
+        id: saved.id,
+        parentId,
+        authorId: userId,
+        topics: extractTopics(input.content),
+      });
+      await publishLiveChange(tx, await affectedPostIds(tx, saved.id));
       if (parentAuthor)
         await recordNotification(tx, {
           recipientId: parentAuthor,
@@ -138,9 +171,26 @@ async function createPost({
           postId: saved.id,
           subject: saved.id,
         });
+      if (quotedAuthor && quotedAuthor !== userId) {
+        // Someone tagged in their own quote already gets a mention notification.
+        const [mentioned] = await tx
+          .select({ userId: postMentions.userId })
+          .from(postMentions)
+          .where(and(eq(postMentions.postId, saved.id), eq(postMentions.userId, quotedAuthor)))
+          .limit(1);
+        if (!mentioned)
+          await recordNotification(tx, {
+            recipientId: quotedAuthor,
+            actorId: userId,
+            kind: "quote",
+            postId: saved.id,
+            subject: saved.id,
+          });
+      }
       return saved.id;
     }
     if (!input.clientId) {
+      if (quotedGone) throw new AuthError(404, "post_not_found");
       if (expired) throw new AuthError(400, voice ? "invalid_voice_selection" : "invalid_gif_selection");
       throw new Error("Post ID collision");
     }
@@ -149,6 +199,8 @@ async function createPost({
         id: posts.id,
         authorId: posts.authorId,
         parentId: posts.parentId,
+        quotedPostId: posts.quotedPostId,
+        isQuote: posts.isQuote,
         content: posts.content,
         gif: posts.gif,
         voice: posts.voice,
@@ -156,11 +208,15 @@ async function createPost({
       })
       .from(posts)
       .where(eq(posts.id, input.clientId));
+    if (!existing && quotedGone) throw new AuthError(404, "post_not_found");
     const savedPoll = existing?.poll;
     if (
       !existing ||
       existing.authorId !== userId ||
       existing.parentId !== parentId ||
+      // A quote whose original was deleted since keeps its flag but loses the link.
+      existing.isQuote !== (quotedPostId !== null) ||
+      (existing.quotedPostId !== null && existing.quotedPostId !== quotedPostId) ||
       existing.content !== input.content ||
       existing.gif?.url !== gif?.url ||
       existing.voice?.key !== voice?.key ||
@@ -179,6 +235,40 @@ router.use((_req, res, next) => {
   res.set("Cache-Control", "no-store");
   next();
 });
+// For each reply in `page`, the posts above it, root first.
+async function loadAncestors(
+  page: { id: string; parentId: string | null }[],
+  viewerId: string | null,
+) {
+  const replyIds = page.filter((row) => row.parentId).map((row) => row.id);
+  const result = new Map<string, ReturnType<typeof serializePost>[]>();
+  if (!replyIds.length) return result;
+  const chains = await db.execute<{ origin: string; id: string }>(sql`
+    with recursive chain as (
+      select id as origin, parent_id as id, 1 as depth
+      from posts where id in (${sql.join(
+        replyIds.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )}) and parent_id is not null
+      union all
+      select c.origin, p.parent_id, c.depth + 1
+      from chain c join posts p on p.id = c.id
+      where p.parent_id is not null and c.depth < 100
+    )
+    select origin, id from chain order by origin, depth desc
+  `);
+  const ancestorRows = await db
+    .select(postSelection(viewerId))
+    .from(posts)
+    .innerJoin(users, eq(users.id, posts.authorId))
+    .where(inArray(posts.id, [...new Set(chains.rows.map((row) => row.id))]));
+  const byId = new Map(ancestorRows.map((row) => [row.id, serializePost(row)]));
+  for (const { origin, id } of chains.rows) {
+    const found = byId.get(id);
+    if (found) result.set(origin, [...(result.get(origin) ?? []), found]);
+  }
+  return result;
+}
 const listPosts: import("express").RequestHandler = async (req, res) => {
   const parentId =
     typeof req.params.id === "string" ? req.params.id : undefined;
@@ -200,6 +290,11 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
       throw new AuthError(400, "invalid_cursor");
     }
   }
+  if (!parentId && !topic) {
+    const feed = await homeFeed(viewerId, cursor && { createdAt: cursor.createdAt, id: cursor.id }, 20);
+    res.json({ ...feed, serverNow: new Date().toISOString() });
+    return;
+  }
   const rows = await db
     .select(postSelection(viewerId))
     .from(posts)
@@ -207,7 +302,6 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
     .where(
       and(
         parentId ? eq(posts.parentId, parentId) : undefined,
-        !parentId && !topic ? isNull(posts.parentId) : undefined,
         topic
           ? inArray(
               posts.id,
@@ -232,8 +326,16 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
     .limit(21);
   const page = rows.slice(0, 20);
   const last = page.at(-1);
+  // A topic lists replies next to posts; send the chain above each reply so
+  // clients can show it in context instead of as a stray post.
+  const ancestors = topic ? await loadAncestors(page, viewerId) : undefined;
   res.json({
-    posts: page.map(serializePost),
+    repostedBy: {},
+    posts: page.map((row) =>
+      ancestors
+        ? { ...serializePost(row), ancestors: ancestors.get(row.id) ?? [] }
+        : serializePost(row),
+    ),
     nextCursor:
       rows.length > 20 && last
         ? Buffer.from(
@@ -261,12 +363,30 @@ router.get("/poll-results", async (req, res) => {
     .where(and(inArray(posts.id, parsed.data.ids), sql`${posts.poll} is not null`));
   res.json({ viewerId, results });
 });
+router.get("/states", async (req, res) => {
+  const parsed = z.strictObject({
+    ids: z.string().max(50 * 37).transform((value) => value.split(","))
+      .pipe(z.array(z.uuid()).min(1).max(50)),
+  }).safeParse(req.query);
+  if (!parsed.success) throw new AuthError(400, "invalid_post_id");
+  const viewerId = await readViewerId(req);
+  const rows = await db
+    .select(postSelection(viewerId))
+    .from(posts)
+    .innerJoin(users, eq(users.id, posts.authorId))
+    .where(inArray(posts.id, parsed.data.ids));
+  res.json({ viewerId, posts: rows.map((row) => serializePost(row)) });
+});
 router.post("/", async (req, res) => {
   const user = await requireUser(req);
   const parsed = createSchema.safeParse(req.body);
   if (!parsed.success) throw new AuthError(400, "invalid_content");
   res.status(201).json({
-    post: await createPost({ userId: user.id, input: parsed.data }),
+    post: await createPost({
+      userId: user.id,
+      input: parsed.data,
+      quotedPostId: parsed.data.quotedPostId ?? null,
+    }),
     serverNow: new Date().toISOString(),
   });
 });
@@ -431,6 +551,7 @@ router.put("/:id/poll/vote", async (req, res) => {
         set: { optionIndex },
       });
 
+    await publishLiveChange(tx, [postId]);
     const [result] = await tx
       .select({ poll: pollSelection(user.id) })
       .from(posts)
@@ -482,35 +603,59 @@ router.get("/:id/poll/voters", async (req, res) => {
 router.get("/:id/activity", async (req, res) => {
   const query = z
     .object({
-      type: z.enum(["likes", "reposts"]),
+      type: z.enum(["likes", "reposts", "quotes"]),
       cursor: z.uuid().optional(),
     })
     .safeParse(req.query);
   if (!query.success) throw new AuthError(400, "invalid_activity_query");
   await findPost(req.params.id);
-  const activity = query.data.type === "likes" ? postLikes : postReposts;
-  const rows = await db
-    .select(userSelection)
-    .from(activity)
-    .innerJoin(users, eq(users.id, activity.userId))
-    .where(
-      and(
-        eq(activity.postId, req.params.id),
-        query.data.cursor ? gt(activity.userId, query.data.cursor) : undefined,
-      ),
-    )
-    .orderBy(asc(activity.userId))
-    .limit(51);
+  const { type, cursor } = query.data;
+  const rows =
+    type === "quotes"
+      ? await db
+          .select({ ...userSelection, quoteId: posts.id })
+          .from(posts)
+          .innerJoin(users, eq(users.id, posts.authorId))
+          .where(and(eq(posts.quotedPostId, req.params.id), cursor ? gt(posts.id, cursor) : undefined))
+          .orderBy(asc(posts.id))
+          .limit(51)
+      : type === "likes"
+        ? await db
+            .select(userSelection)
+            .from(postLikes)
+            .innerJoin(users, eq(users.id, postLikes.userId))
+            .where(and(eq(postLikes.postId, req.params.id), cursor ? gt(postLikes.userId, cursor) : undefined))
+            .orderBy(asc(postLikes.userId))
+            .limit(51)
+        : await db
+            .select(userSelection)
+            .from(alias(postReposts, "r"))
+            .innerJoin(users, eq(users.id, sql`r.user_id`))
+            .where(
+              and(
+                sql`r.post_id = ${req.params.id}`,
+                // Friends-only reposts are listed only to the reposter and their friends.
+                repostVisibleSql(await readViewerId(req)),
+                cursor ? sql`r.user_id > ${cursor}` : undefined,
+              ),
+            )
+            .orderBy(sql`r.user_id`)
+            .limit(51);
   const page = rows.slice(0, 50);
+  // Quotes page by the quote's own id, the others by user id.
+  const last = page.at(-1);
+  const pageKey = last && "quoteId" in last ? (last.quoteId as string) : last?.id;
   res.json({
     users: page,
-    nextCursor: rows.length > 50 ? (page.at(-1)?.id ?? null) : null,
+    nextCursor: rows.length > 50 ? (pageKey ?? null) : null,
   });
 });
 router.post("/:id/replies", async (req, res) => {
   const user = await requireUser(req);
   const parsed = createSchema.safeParse(req.body);
-  if (!parsed.success) throw new AuthError(400, "invalid_content");
+  // Quotes are top-level posts, never replies.
+  if (!parsed.success || parsed.data.quotedPostId)
+    throw new AuthError(400, "invalid_content");
   res.status(201).json({
     post: await createPost({
       userId: user.id,
@@ -552,6 +697,7 @@ async function setLike(req: Request, liked: boolean) {
         .delete(postLikes)
         .where(and(eq(postLikes.postId, id), eq(postLikes.userId, user.id)));
     }
+    await publishLiveChange(tx, [id]);
     const [state] = await tx
       .select(reactionSelection(user.id))
       .from(posts)
@@ -565,25 +711,40 @@ router.put("/:id/like", async (req, res) => {
 router.delete("/:id/like", async (req, res) => {
   res.json(await setLike(req, false));
 });
+const repostBodySchema = z.strictObject({
+  audience: z.enum(["public", "friends"]).default("public"),
+});
 async function setRepost(req: Request, reposted: boolean) {
   const user = await requireUser(req);
   const parsedId = z.uuid().safeParse(req.params.id);
   if (!parsedId.success) throw new AuthError(400, "invalid_post_id");
   const id = parsedId.data;
+  const body = repostBodySchema.safeParse(reposted ? (req.body ?? {}) : {});
+  if (!body.success) throw new AuthError(400, "invalid_repost");
+  const { audience } = body.data;
   return db.transaction(async (tx) => {
     const [post] = await tx
-      .select({ id: posts.id, authorId: posts.authorId })
+      .select({ id: posts.id, authorId: posts.authorId, parentId: posts.parentId })
       .from(posts)
       .where(eq(posts.id, id))
       .for("update");
     if (!post) throw new AuthError(404, "post_not_found");
     if (reposted) {
-      const [inserted] = await tx
+      // Reposting again with another audience switches the existing repost.
+      await tx
         .insert(postReposts)
-        .values({ postId: id, userId: user.id })
-        .onConflictDoNothing()
-        .returning();
-      if (inserted)
+        .values({ postId: id, userId: user.id, audience })
+        .onConflictDoUpdate({
+          target: [postReposts.postId, postReposts.userId],
+          set: { audience },
+        });
+      // A friends-only repost must not tell a stranger about it.
+      const [{ friends }] = (
+        await tx.execute<{ friends: boolean }>(
+          sql`select ${mutualFollowSql(user.id, sql`${post.authorId}::uuid`)} as friends`,
+        )
+      ).rows;
+      if (audience === "public" || friends)
         await recordNotification(tx, {
           recipientId: post.authorId,
           actorId: user.id,
@@ -591,6 +752,17 @@ async function setRepost(req: Request, reposted: boolean) {
           postId: id,
           subject: id,
         });
+      else
+        await tx
+          .delete(notifications)
+          .where(
+            and(
+              eq(notifications.recipientId, post.authorId),
+              eq(notifications.actorId, user.id),
+              eq(notifications.kind, "repost"),
+              eq(notifications.subject, id),
+            ),
+          );
     } else {
       await tx
         .delete(postReposts)
@@ -598,6 +770,15 @@ async function setRepost(req: Request, reposted: boolean) {
           and(eq(postReposts.postId, id), eq(postReposts.userId, user.id)),
         );
     }
+    await publishLiveChange(tx, [id]);
+    if (reposted)
+      await publishLivePost(tx, {
+        id,
+        parentId: post.parentId,
+        authorId: user.id,
+        topics: [],
+        reposted: true,
+      });
     const [state] = await tx
       .select(repostSelection(user.id))
       .from(posts)
@@ -654,6 +835,7 @@ router.patch("/:id", async (req, res) => {
         versionAt: existing.editedAt ?? existing.createdAt,
       });
     await syncMentions(tx, saved.id, user.id, parsed.data.content);
+    await publishLiveChange(tx, await affectedPostIds(tx, saved.id));
     return saved;
   });
   res.json({
@@ -663,10 +845,15 @@ router.patch("/:id", async (req, res) => {
 });
 router.delete("/:id", async (req, res) => {
   const user = await requireUser(req);
-  const [deleted] = await db
-    .delete(posts)
-    .where(and(eq(posts.id, req.params.id), eq(posts.authorId, user.id)))
-    .returning({ id: posts.id, voice: posts.voice });
+  const [deleted] = await db.transaction(async (tx) => {
+    const affected = await affectedPostIds(tx, req.params.id);
+    const removed = await tx
+      .delete(posts)
+      .where(and(eq(posts.id, req.params.id), eq(posts.authorId, user.id)))
+      .returning({ id: posts.id, voice: posts.voice });
+    if (removed.length) await publishLiveChange(tx, affected);
+    return removed;
+  });
   if (!deleted) {
     await findPost(req.params.id);
     throw new AuthError(403, "not_post_author");

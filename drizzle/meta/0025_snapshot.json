@@ -1,6 +1,6 @@
 {
-  "id": "ed0ef8cd-d930-439a-b51a-3c32bc88eb09",
-  "prevId": "63748473-2f86-464d-aa00-13850684594d",
+  "id": "63748473-2f86-464d-aa00-13850684594d",
+  "prevId": "d4f569cc-122e-41b2-9e41-14472bce6c37",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -161,6 +161,74 @@
           "tableTo": "auth_identities",
           "columnsFrom": [
             "identity_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.avatar_history": {
+      "name": "avatar_history",
+      "schema": "",
+      "columns": {
+        "key": {
+          "name": "key",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "used_at": {
+          "name": "used_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "avatar_history_user_idx": {
+          "name": "avatar_history_user_idx",
+          "columns": [
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "used_at",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "avatar_history_user_id_users_id_fk": {
+          "name": "avatar_history_user_id_users_id_fk",
+          "tableFrom": "avatar_history",
+          "tableTo": "users",
+          "columnsFrom": [
+            "user_id"
           ],
           "columnsTo": [
             "id"
@@ -777,6 +845,13 @@
           "primaryKey": false,
           "notNull": true
         },
+        "audience": {
+          "name": "audience",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'public'"
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp (3) with time zone",
@@ -803,6 +878,27 @@
             },
             {
               "expression": "post_id",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "post_reposts_post_idx": {
+          "name": "post_reposts_post_idx",
+          "columns": [
+            {
+              "expression": "post_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
               "isExpression": false,
               "asc": false,
               "nulls": "last"
@@ -853,7 +949,12 @@
       },
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "post_reposts_audience_check": {
+          "name": "post_reposts_audience_check",
+          "value": "\"post_reposts\".\"audience\" IN ('public', 'friends')"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.post_topics": {
@@ -953,6 +1054,19 @@
           "primaryKey": false,
           "notNull": false
         },
+        "quoted_post_id": {
+          "name": "quoted_post_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "is_quote": {
+          "name": "is_quote",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
         "content": {
           "name": "content",
           "type": "text",
@@ -961,12 +1075,6 @@
         },
         "gif": {
           "name": "gif",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "voice": {
-          "name": "voice",
           "type": "jsonb",
           "primaryKey": false,
           "notNull": false
@@ -989,9 +1097,31 @@
           "type": "timestamp (3) with time zone",
           "primaryKey": false,
           "notNull": false
+        },
+        "voice": {
+          "name": "voice",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
         }
       },
       "indexes": {
+        "posts_quoted_idx": {
+          "name": "posts_quoted_idx",
+          "columns": [
+            {
+              "expression": "quoted_post_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"posts\".\"quoted_post_id\" IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "posts_parent_idx": {
           "name": "posts_parent_idx",
           "columns": [
@@ -1067,12 +1197,29 @@
           ],
           "onDelete": "cascade",
           "onUpdate": "no action"
+        },
+        "posts_quoted_post_id_posts_id_fk": {
+          "name": "posts_quoted_post_id_posts_id_fk",
+          "tableFrom": "posts",
+          "tableTo": "posts",
+          "columnsFrom": [
+            "quoted_post_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {
+        "posts_quote_check": {
+          "name": "posts_quote_check",
+          "value": "(\"posts\".\"is_quote\" OR \"posts\".\"quoted_post_id\" IS NULL) AND (NOT \"posts\".\"is_quote\" OR \"posts\".\"parent_id\" IS NULL)"
+        },
         "posts_content_check": {
           "name": "posts_content_check",
           "value": "char_length(\"posts\".\"content\") <= 2000 AND (\"posts\".\"content\" ~ '[^[:space:]]' OR (\"posts\".\"content\" = '' AND (\"posts\".\"gif\" IS NOT NULL OR \"posts\".\"poll\" IS NOT NULL OR \"posts\".\"voice\" IS NOT NULL)))"
@@ -1488,150 +1635,6 @@
         }
       },
       "isRLSEnabled": false
-    },
-    "public.voice_jobs": {
-      "name": "voice_jobs",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "user_id": {
-          "name": "user_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "input": {
-          "name": "input",
-          "type": "bytea",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "voice": {
-          "name": "voice",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "error": {
-          "name": "error",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "lease": {
-          "name": "lease",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "attempts": {
-          "name": "attempts",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "default": 0
-        },
-        "next_attempt_at": {
-          "name": "next_attempt_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        },
-        "expires_at": {
-          "name": "expires_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true
-        }
-      },
-      "indexes": {
-        "voice_jobs_user_pending_idx": {
-          "name": "voice_jobs_user_pending_idx",
-          "columns": [
-            {
-              "expression": "user_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "where": "\"voice_jobs\".\"input\" IS NOT NULL",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "voice_jobs_due_idx": {
-          "name": "voice_jobs_due_idx",
-          "columns": [
-            {
-              "expression": "next_attempt_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"voice_jobs\".\"input\" IS NOT NULL",
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "voice_jobs_expiry_idx": {
-          "name": "voice_jobs_expiry_idx",
-          "columns": [
-            {
-              "expression": "expires_at",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {
-        "voice_jobs_user_id_users_id_fk": {
-          "name": "voice_jobs_user_id_users_id_fk",
-          "tableFrom": "voice_jobs",
-          "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {
-        "voice_jobs_user_id_id_pk": {
-          "name": "voice_jobs_user_id_id_pk",
-          "columns": [
-            "user_id",
-            "id"
-          ]
-        }
-      },
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {
-        "voice_jobs_one_state": {
-          "name": "voice_jobs_one_state",
-          "value": "num_nonnulls(\"voice_jobs\".\"input\", \"voice_jobs\".\"voice\", \"voice_jobs\".\"error\") = 1"
-        }
-      },
-      "isRLSEnabled": false
     }
   },
   "enums": {
@@ -1643,7 +1646,8 @@
         "repost",
         "reply",
         "follow",
-        "mention"
+        "mention",
+        "quote"
       ]
     }
   },

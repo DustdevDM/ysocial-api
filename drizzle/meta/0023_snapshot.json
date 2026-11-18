@@ -1,5 +1,5 @@
 {
-  "id": "63748473-2f86-464d-aa00-13850684594d",
+  "id": "797aa869-5c1f-43f3-bcc7-8ca49f0137ad",
   "prevId": "c047c2d0-18ed-45ff-8753-7b77795ffb01",
   "version": "7",
   "dialect": "postgresql",
@@ -777,6 +777,13 @@
           "primaryKey": false,
           "notNull": true
         },
+        "audience": {
+          "name": "audience",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'public'"
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp (3) with time zone",
@@ -803,6 +810,27 @@
             },
             {
               "expression": "post_id",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "post_reposts_post_idx": {
+          "name": "post_reposts_post_idx",
+          "columns": [
+            {
+              "expression": "post_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
               "isExpression": false,
               "asc": false,
               "nulls": "last"
@@ -853,7 +881,12 @@
       },
       "uniqueConstraints": {},
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "post_reposts_audience_check": {
+          "name": "post_reposts_audience_check",
+          "value": "\"post_reposts\".\"audience\" IN ('public', 'friends')"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.post_topics": {
@@ -953,6 +986,19 @@
           "primaryKey": false,
           "notNull": false
         },
+        "quoted_post_id": {
+          "name": "quoted_post_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "is_quote": {
+          "name": "is_quote",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
         "content": {
           "name": "content",
           "type": "text",
@@ -961,12 +1007,6 @@
         },
         "gif": {
           "name": "gif",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "voice": {
-          "name": "voice",
           "type": "jsonb",
           "primaryKey": false,
           "notNull": false
@@ -992,6 +1032,22 @@
         }
       },
       "indexes": {
+        "posts_quoted_idx": {
+          "name": "posts_quoted_idx",
+          "columns": [
+            {
+              "expression": "quoted_post_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"posts\".\"quoted_post_id\" IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "posts_parent_idx": {
           "name": "posts_parent_idx",
           "columns": [
@@ -1067,15 +1123,32 @@
           ],
           "onDelete": "cascade",
           "onUpdate": "no action"
+        },
+        "posts_quoted_post_id_posts_id_fk": {
+          "name": "posts_quoted_post_id_posts_id_fk",
+          "tableFrom": "posts",
+          "tableTo": "posts",
+          "columnsFrom": [
+            "quoted_post_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {
+        "posts_quote_check": {
+          "name": "posts_quote_check",
+          "value": "(\"posts\".\"is_quote\" OR \"posts\".\"quoted_post_id\" IS NULL) AND (NOT \"posts\".\"is_quote\" OR \"posts\".\"parent_id\" IS NULL)"
+        },
         "posts_content_check": {
           "name": "posts_content_check",
-          "value": "char_length(\"posts\".\"content\") <= 2000 AND (\"posts\".\"content\" ~ '[^[:space:]]' OR (\"posts\".\"content\" = '' AND (\"posts\".\"gif\" IS NOT NULL OR \"posts\".\"poll\" IS NOT NULL OR \"posts\".\"voice\" IS NOT NULL)))"
+          "value": "char_length(\"posts\".\"content\") <= 2000 AND (\"posts\".\"content\" ~ '[^[:space:]]' OR (\"posts\".\"content\" = '' AND (\"posts\".\"gif\" IS NOT NULL OR \"posts\".\"poll\" IS NOT NULL)))"
         }
       },
       "isRLSEnabled": false
@@ -1499,7 +1572,8 @@
         "repost",
         "reply",
         "follow",
-        "mention"
+        "mention",
+        "quote"
       ]
     }
   },

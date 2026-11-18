@@ -47,6 +47,7 @@ export const env = z
       .int()
       .min(1000)
       .default(30_000),
+    LIVE_MAX_STREAMS: z.coerce.number().int().min(0).default(2000),
     SHUTDOWN_DRAIN_MS: z.coerce.number().int().min(0).max(60_000).default(0),
     SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(1000).default(20_000),
   })

@@ -21,15 +21,66 @@ export function reactionSelection(viewerId: string | null) {
         : sql<boolean>`exists(select 1 from ${postLikes} where ${postLikes.postId} = ${posts.id} and ${postLikes.userId} = ${viewerId})`,
   };
 }
+// "Friends" are mutual follows. True when the viewer and the user in `other`
+// follow each other.
+export const mutualFollowSql = (viewerId: string, other: ReturnType<typeof sql>) => sql`(
+  exists (select 1 from user_follows mf_a where mf_a.follower_id = ${viewerId} and mf_a.following_id = ${other})
+  and exists (select 1 from user_follows mf_b where mf_b.follower_id = ${other} and mf_b.following_id = ${viewerId}))`;
+// Whether the viewer may see this repost row (alias `r`): public ones, their own,
+// and friends-only ones from people they follow mutually.
+export function repostVisibleSql(viewerId: string | null) {
+  return viewerId === null
+    ? sql`r.audience = 'public'`
+    : sql`(r.audience = 'public' or r.user_id = ${viewerId} or ${mutualFollowSql(viewerId, sql`r.user_id`)})`;
+}
 export function repostSelection(viewerId: string | null) {
   return {
-    reposts: sql<number>`(select count(*)::int from ${postReposts} where ${postReposts.postId} = ${posts.id})`,
+    // Only public reposts are counted, so a friends-only repost never shows up as a number.
+    reposts: sql<number>`(select count(*)::int from ${postReposts} where ${postReposts.postId} = ${posts.id} and ${postReposts.audience} = 'public')`,
     reposted:
       viewerId === null
         ? sql<boolean>`false`
         : sql<boolean>`exists(select 1 from ${postReposts} where ${postReposts.postId} = ${posts.id} and ${postReposts.userId} = ${viewerId})`,
+    repostAudience:
+      viewerId === null
+        ? sql<"public" | "friends" | null>`null`
+        : sql<"public" | "friends" | null>`(select ${postReposts.audience} from ${postReposts} where ${postReposts.postId} = ${posts.id} and ${postReposts.userId} = ${viewerId})`,
   };
 }
+export type QuotedPost = {
+  id: string;
+  content: string;
+  gif: { url: string; title: string } | null;
+  createdAt: string;
+  editedAt: string | null;
+  parentId: string | null;
+  pollTitle: string | null;
+  isQuote: boolean;
+  author: { id: string; handle: string; displayName: string; avatarUrl: string | null };
+};
+export type PostQuote = { state: "available"; post: QuotedPost } | { state: "unavailable" };
+export const quoteSelection = {
+  quotes: sql<number>`(select count(*)::int from posts q where q.quoted_post_id = ${posts.id})`,
+  // The embedded post, one level deep. Null for posts that are not quotes.
+  quote: sql<PostQuote | null>`case when ${posts.isQuote} then (
+    case when ${posts.quotedPostId} is null then jsonb_build_object('state', 'unavailable')
+    else (
+      select jsonb_build_object('state', 'available', 'post', jsonb_build_object(
+        'id', q.id, 'content', q.content, 'gif', q.gif,
+        'createdAt', q.created_at, 'editedAt', q.edited_at, 'parentId', q.parent_id,
+        'pollTitle', q.poll->>'title', 'isQuote', q.is_quote,
+        'author', jsonb_build_object('id', u.id, 'handle', u.handle, 'displayName', u.display_name,
+          'avatarUrl', coalesce('/api/' || u.avatar_key, (select ai.picture from auth_identities ai where ai.user_id = u.id and ai.deleted_at is null)))
+      ))
+      from posts q join users u on u.id = q.author_id where q.id = ${posts.quotedPostId}
+    ) end
+  ) end`,
+  // Who a reply answers, so a reply shown outside its thread still has context.
+  replyTo: sql<{ id: string; handle: string; displayName: string } | null>`(
+    select jsonb_build_object('id', pp.id, 'handle', pu.handle, 'displayName', pu.display_name)
+    from posts pp join users pu on pu.id = pp.author_id where pp.id = ${posts.parentId}
+  )`,
+};
 type PollResult = Omit<PollDefinition, "options"> & {
   allowRevote: true;
   options: { label: string; votes: number }[];
@@ -83,6 +134,7 @@ export const postSelection = (viewerId: string | null) => ({
   ...reactionSelection(viewerId),
   ...friendLikeSelection(viewerId),
   ...repostSelection(viewerId),
+  ...quoteSelection,
   ...postFields,
   poll: pollSelection(viewerId),
   mentions: sql<{ id: string; handle: string; username: string }[]>`(

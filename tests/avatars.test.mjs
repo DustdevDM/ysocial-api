@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { createHmac, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { once } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { config } from "dotenv";
 import pg from "pg";
 import sharp from "sharp";
+import { makeVoiceWav } from "./fixtures/voice.mjs";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import {
   DeleteObjectCommand,
@@ -44,6 +46,7 @@ await test("avatar upload, persistence, access, and failures", async (t) => {
   const uploaded = [];
   const objects = new Map();
   let failWrites = false;
+  let holdVoiceWrite;
   let failDeletes = false;
   if (!live) {
     // Only replace the external storage transport. HTTP, authentication, PostgreSQL,
@@ -73,13 +76,16 @@ await test("avatar upload, persistence, access, and failures", async (t) => {
           };
         }
         const key = decodeURIComponent(
-          request.path.match(/(?:avatars|banners)\/.+$/)[0],
+          request.path.match(/(?:avatars|banners|voices)\/.+$/)[0],
         );
         if (request.method === "PUT") {
           if (failWrites) throw new Error("Simulated R2 outage");
+          if (key.startsWith("voices/")) await holdVoiceWrite;
           assert.equal(
             request.headers["content-type"],
-            key.endsWith(".gif")
+            key.endsWith(".m4a")
+              ? "audio/mp4"
+              : key.endsWith(".gif")
               ? "image/gif"
               : key.endsWith(".png")
                 ? "image/png"
@@ -176,6 +182,212 @@ await test("avatar upload, persistence, access, and failures", async (t) => {
       );
     }
     let firstUrl;
+    await t.test("voice uploads, posts, replies, retries, range playback and deletion", async () => {
+      async function voiceUpload(body, overrides = {}) {
+        return fetch(`${origin}/api/voices`, {
+          method: "POST", headers: { ...headers, "Content-Type": "audio/wav", ...overrides }, body,
+        });
+      }
+      async function postRequest(path, body, method = "POST") {
+        return fetch(origin + path, {
+          method, headers: { ...headers, "Content-Type": "application/json" },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        });
+      }
+      const wav = makeVoiceWav(3);
+      assert.equal((await voiceUpload(wav, { Cookie: "" })).status, 401);
+      assert.equal((await voiceUpload(wav, { Origin: "https://other.invalid" })).status, 403);
+      assert.equal((await voiceUpload(wav, { "Content-Type": "text/plain" })).status, 415);
+      assert.equal((await voiceUpload(Buffer.alloc(8 * 1024 * 1024 + 1))).status, 413);
+      const short = await voiceUpload(makeVoiceWav(1));
+      assert.equal(short.status, 400);
+      assert.equal((await short.json()).error, "voice_too_short");
+      const response = await voiceUpload(wav);
+      assert.equal(response.status, 201);
+      const voice = await response.json();
+      uploaded.push(voice.key);
+      assert.equal(voice.durationMs, 3000);
+      assert.equal(voice.waveform.length, 48);
+      assert.ok(voice.waveform.some((level) => level > 0));
+      assert.ok(voice.waveform.every((level) => Number.isInteger(level) && level >= 0 && level <= 100));
+      assert.ok(voice.bytes < 60000);
+      assert.equal((await fetch(origin + voice.url)).status, 404, "unattached uploads are private");
+      const { readVoiceSelection } = await import("../src/storage/voice-selection.ts");
+      assert.throws(() => readVoiceSelection(voice.token, bob.id));
+      const invalid = await postRequest("/api/posts", { voiceToken: `${voice.token}x` });
+      assert.equal(invalid.status, 400);
+      const clientId = randomUUID();
+      const input = { clientId, voiceToken: voice.token };
+      const created = await postRequest("/api/posts", input);
+      assert.equal(created.status, 201);
+      const post = (await created.json()).post;
+      assert.equal((await postRequest("/api/voices", { token: voice.token }, "DELETE")).status, 204);
+      assert.equal((await fetch(origin + voice.url)).status, 200, "discard cannot delete posted audio");
+      assert.equal(post.content, "");
+      assert.equal(post.voice.url, voice.url);
+      assert.deepEqual(post.voice.waveform, voice.waveform);
+      assert.equal((await pool.query("SELECT key FROM media_deletions WHERE key = $1", [voice.key])).rowCount, 0);
+      const retried = await postRequest("/api/posts", input);
+      assert.equal(retried.status, 201);
+      assert.equal((await retried.json()).post.id, post.id);
+      assert.equal((await postRequest("/api/posts", { voiceToken: voice.token })).status, 400, "single use");
+      assert.equal((await postRequest("/api/posts", { ...input, content: "changed" })).status, 400);
+      const audio = await fetch(origin + voice.url);
+      assert.equal(audio.status, 200);
+      assert.match(audio.headers.get("content-type"), /audio\/mp4/);
+      assert.equal((await audio.arrayBuffer()).byteLength, voice.bytes);
+      const range = await fetch(origin + voice.url, { headers: { Range: "bytes=0-99" } });
+      assert.equal(range.status, 206);
+      assert.equal((await range.arrayBuffer()).byteLength, 100);
+      assert.equal(range.headers.get("content-range"), `bytes 0-99/${voice.bytes}`);
+      assert.equal((await fetch(origin + voice.url, { headers: { Range: `bytes=${voice.bytes + 1}-` } })).status, 416);
+      assert.equal((await postRequest(`/api/posts/${post.id}`, { content: "Caption" }, "PATCH")).status, 200);
+      assert.equal((await postRequest(`/api/posts/${post.id}`, { content: "" }, "PATCH")).status, 200);
+      const nextVoiceResponse = await voiceUpload(wav);
+      const nextVoice = await nextVoiceResponse.json();
+      uploaded.push(nextVoice.key);
+      const replied = await postRequest(`/api/posts/${post.id}/replies`, { voiceToken: nextVoice.token });
+      assert.equal(replied.status, 201);
+      const reply = (await replied.json()).post;
+      assert.equal(reply.voice.url, nextVoice.url);
+      const thread = await (await fetch(`${origin}/api/posts/${post.id}/replies`)).json();
+      assert.equal(thread.posts[0].voice.durationMs, 3000);
+      assert.equal((await postRequest(`/api/posts/${post.id}`, undefined, "DELETE")).status, 204);
+      assert.equal((await fetch(origin + voice.url)).status, 404);
+      assert.equal((await fetch(origin + nextVoice.url)).status, 404);
+      assert.deepEqual(
+        (await pool.query("SELECT key FROM media_deletions WHERE key = ANY($1)", [[voice.key, nextVoice.key]])).rows,
+        [{ key: nextVoice.key }],
+        "the deleted post is cleaned immediately and cascaded replies remain queued",
+      );
+      await assertObjectDeleted(voice.key);
+      assert.equal((await postRequest("/api/posts", { voiceToken: voice.token })).status, 400, "deleted recordings cannot be reused");
+      const { flushMediaDeletions } = await import("../src/storage/media-lifecycle.ts");
+      await flushMediaDeletions();
+      await assertObjectDeleted(voice.key);
+      await assertObjectDeleted(nextVoice.key);
+      for (const action of ["discard", "expire"]) {
+        const draft = await (await voiceUpload(wav)).json();
+        uploaded.push(draft.key);
+        const { rows: [pending] } = await pool.query("SELECT available_at FROM media_deletions WHERE key = $1", [draft.key]);
+        const remaining = pending.available_at.getTime() - Date.now();
+        assert.ok(remaining > 29 * 60 * 1000 && remaining <= 30 * 60 * 1000);
+        const selection = readVoiceSelection(draft.token, alice.id);
+        assert.ok(selection.expires - Date.now() <= 30 * 60 * 1000);
+        if (action === "discard") {
+          const denied = await fetch(origin + "/api/voices", { method: "DELETE", headers: { ...headers, Cookie: "", "Content-Type": "application/json" }, body: JSON.stringify({ token: draft.token }) });
+          assert.equal(denied.status, 401);
+          assert.equal((await postRequest("/api/voices", { token: draft.token + "x" }, "DELETE")).status, 400);
+          assert.equal((await postRequest("/api/voices", { token: draft.token }, "DELETE")).status, 204);
+          assert.equal((await postRequest("/api/voices", { token: draft.token }, "DELETE")).status, 204, "idempotent discard");
+        } else {
+          await flushMediaDeletions(draft.key);
+          if (!live) assert.ok(objects.has(draft.key), "draft remains until its deadline");
+          await pool.query("UPDATE media_deletions SET available_at = now() - interval '1 second' WHERE key = $1", [draft.key]);
+          assert.equal((await postRequest("/api/posts", { voiceToken: draft.token })).status, 400, "expired draft cannot be published");
+          await flushMediaDeletions(draft.key);
+        }
+        await assertObjectDeleted(draft.key);
+        assert.equal((await postRequest("/api/posts", { voiceToken: draft.token })).status, 400);
+      }
+    });
+    await t.test("slow storage returns a queued upload before the write completes", { skip: live }, async () => {
+      let releaseWrite;
+      holdVoiceWrite = new Promise((resolve) => { releaseWrite = resolve; });
+      const id = randomUUID();
+      const path = `${origin}/api/voices/jobs/${id}`;
+      try {
+        const upload = await fetch(`${origin}/api/voices`, {
+          method: "POST",
+          headers: { ...headers, "Content-Type": "audio/wav", "Idempotency-Key": id },
+          body: makeVoiceWav(3),
+          signal: AbortSignal.timeout(5000),
+        });
+        assert.equal(upload.status, 202);
+        assert.deepEqual(await upload.json(), { pending: true, jobId: id });
+        assert.equal((await fetch(path, { headers: { Cookie: headers.Cookie } })).status, 202);
+      } finally {
+        releaseWrite();
+        holdVoiceWrite = undefined;
+      }
+      let response;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        response = await fetch(path, { headers: { Cookie: headers.Cookie } });
+        if (response.status !== 202) break;
+        await response.arrayBuffer();
+        await delay(100);
+      }
+      assert.equal(response?.status, 200);
+      uploaded.push((await response.json()).key);
+      assert.equal((await fetch(path, { method: "DELETE", headers })).status, 204);
+    });
+
+    await t.test("voice jobs recover an expired pod lease and replay the same draft", async () => {
+      const { startVoiceJobs } = await import("../src/storage/voice-jobs.ts");
+      const id = randomUUID();
+      const wav = makeVoiceWav(3);
+      await pool.query(
+        `INSERT INTO voice_jobs (user_id, id, input, lease, next_attempt_at, expires_at)
+         VALUES ($1, $2, $3, $4, now() + interval '1 second', now() + interval '30 minutes')`,
+        [alice.id, id, wav, randomUUID()],
+      );
+      const path = `${origin}/api/voices/jobs/${id}`;
+      const upload = () => fetch(`${origin}/api/voices`, {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "audio/wav", "Idempotency-Key": id },
+        body: wav,
+      });
+      const pending = await upload();
+      assert.equal(pending.status, 202);
+      assert.deepEqual(await pending.json(), { pending: true, jobId: id });
+
+      // A browser's same-origin GET sends the session cookie without an Origin header.
+      const pollHeaders = { Cookie: headers.Cookie };
+      assert.equal((await fetch(path)).status, 401);
+      assert.equal((await fetch(path, { headers: pollHeaders })).status, 202);
+      assert.equal((await fetch(path, { method: "DELETE", headers: pollHeaders })).status, 403);
+
+      const { rows: [otherIdentity] } = await pool.query(
+        "INSERT INTO auth_identities (issuer, subject, user_id) VALUES ('https://test.invalid', 'bob', $1) RETURNING id",
+        [bob.id],
+      );
+      const otherToken = randomUUID();
+      await pool.query(
+        "INSERT INTO auth_sessions (token_hash, identity_id, encrypted_tokens, refresh_after, expires_at) VALUES ($1, $2, 'unused', now() + interval '1 day', now() + interval '2 days')",
+        [hash(otherToken), otherIdentity.id],
+      );
+      const otherHeaders = { Cookie: `session=${otherToken}` };
+      assert.equal((await fetch(path, { headers: otherHeaders })).status, 404);
+
+      const stopWorkers = [startVoiceJobs(), startVoiceJobs()];
+      try {
+        let response;
+        for (let attempt = 0; attempt < 30; attempt++) {
+          response = await fetch(path, { headers: pollHeaders });
+          if (response.status !== 202) break;
+          await response.arrayBuffer();
+          await delay(250);
+        }
+        assert.equal(response?.status, 200);
+        const voice = await response.json();
+        assert.equal((await fetch(path, { headers: otherHeaders })).status, 404);
+        uploaded.push(voice.key);
+        const replays = await Promise.all([upload(), upload()]);
+        for (const replay of replays) {
+          assert.equal(replay.status, 201);
+          assert.deepEqual(await replay.json(), voice);
+        }
+        const { rows: [job] } = await pool.query(
+          "SELECT input, lease FROM voice_jobs WHERE id = $1", [id],
+        );
+        assert.deepEqual(job, { input: null, lease: null });
+        assert.equal((await fetch(path, { method: "DELETE", headers })).status, 204);
+        assert.equal((await upload()).status, 404, "a delayed retry must not revive a cancelled job");
+      } finally {
+        for (const stop of stopWorkers) stop();
+      }
+    });
+
     await t.test(
       "rejects partial R2 settings and fixes jurisdiction to EU",
       () => {

@@ -10,7 +10,7 @@ COPY drizzle ./drizzle
 COPY drizzle.config.ts ./
 ENV NODE_ENV=production
 USER node
-CMD ["node", "node_modules/drizzle-kit/bin.cjs", "migrate"]
+CMD ["node", "src/db/migrate.ts"]
 
 FROM base AS dependencies
 RUN pnpm install --prod --frozen-lockfile

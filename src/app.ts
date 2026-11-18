@@ -2,6 +2,8 @@ import { beginDraining, createHealthRouter, isDraining } from "./health.ts";
 import { startMediaCleanup } from "./storage/media-lifecycle.ts";
 import banners from "./banners.ts";
 import avatars from "./avatars.ts";
+import voices from "./voices.ts";
+import { startVoiceJobs } from "./storage/voice-jobs.ts";
 import { checkAvatarStorage } from "./storage/r2.ts";
 import profiles from "./profiles.ts";
 import posts from "./posts.ts";
@@ -45,6 +47,7 @@ app.use("/api/topics", topics);
 app.use("/api/profiles", profiles);
 app.use("/api/avatars", avatars);
 app.use("/api/banners", banners);
+app.use("/api/voices", voices);
 // Unknown API routes answer in JSON like every other API error.
 app.use(["/api", "/auth"], (_req, res) => {
   res.status(404).json({ error: "route_not_found" });
@@ -88,6 +91,7 @@ app.use(handleError);
 if (import.meta.main) {
   const shutdown = new AbortController();
   let stopMediaCleanup = () => {};
+  let stopVoiceJobs = () => {};
   let stopPushDelivery = () => {};
   const server = app.listen(env.PORT, () =>
     console.info(`API listening on port ${env.PORT}`),
@@ -102,6 +106,7 @@ if (import.meta.main) {
       shutdown.abort();
       stopMediaCleanup();
       stopPushDelivery();
+      stopVoiceJobs();
       setTimeout(() => {
         server.close(() => { void pool.end(); });
         server.closeIdleConnections();
@@ -119,8 +124,11 @@ if (import.meta.main) {
       to_regclass('public.post_likes') IS NOT NULL AND
       to_regclass('public.post_topics') IS NOT NULL AND
       to_regclass('public.media_deletions') IS NOT NULL AND
+      to_regclass('public.voice_jobs') IS NOT NULL AND
+      EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass('public.posts') AND tgname = 'posts_voice_cleanup' AND tgenabled IN ('O', 'A')) AND
       to_regclass('public.posts') IS NOT NULL AND
       EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'posts' AND column_name = 'gif') AND
+      EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'posts' AND column_name = 'voice') AND
       to_regclass('public.post_mentions') IS NOT NULL AND
       to_regclass('public.users') IS NOT NULL AND
       EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'notification_prompt_dismissed') AND
@@ -141,6 +149,7 @@ if (import.meta.main) {
     if (env.R2) await checkAvatarStorage();
     shutdown.signal.throwIfAborted();
     stopMediaCleanup = startMediaCleanup();
+    stopVoiceJobs = startVoiceJobs();
     stopPushDelivery = startPushDelivery();
     startupReady = true;
   } catch (error) {

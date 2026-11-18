@@ -50,6 +50,7 @@ export async function flushPushDeliveries(send = webpush.sendNotification) {
           actor: userSelection,
           content: posts.content,
           hasGif: sql<boolean>`${posts.gif} IS NOT NULL`,
+          hasVoice: sql<boolean>`${posts.voice} IS NOT NULL`,
           expiresAt: authSessions.expiresAt,
         })
         .from(notifications)
@@ -81,7 +82,7 @@ export async function flushPushDeliveries(send = webpush.sendNotification) {
       const preview =
         (notification.kind === "reply" || notification.kind === "mention") &&
         event.content !== null
-          ? notificationPreview(event.content, event.hasGif)
+          ? notificationPreview(event.content, event.hasGif, event.hasVoice)
           : null;
       try {
         await send(

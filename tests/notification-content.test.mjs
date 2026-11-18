@@ -21,3 +21,8 @@ test("GIF posts use their caption or a GIF fallback", () => {
   assert.equal(notificationPreview(""), "");
   assert.equal(notificationPreview(" 👋 ", true), "👋");
 });
+
+test("voice posts use their caption or a voice fallback", () => {
+  assert.equal(notificationPreview("", false, true), "Voice message");
+  assert.equal(notificationPreview(" Listen ", false, true), "Listen");
+});

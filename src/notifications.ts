@@ -52,6 +52,7 @@ router.get("/", async (req, res) => {
       postId: notifications.postId,
       preview: posts.content,
       hasGif: sql<boolean>`${posts.gif} IS NOT NULL`,
+      hasVoice: sql<boolean>`${posts.voice} IS NOT NULL`,
       readAt: notifications.readAt,
       createdAt: notifications.createdAt,
       actor: userSelection,
@@ -85,9 +86,9 @@ router.get("/", async (req, res) => {
   const page = rows.slice(0, 20),
     last = page.at(-1);
   res.json({
-    notifications: page.map(({ hasGif, ...row }) => ({
+    notifications: page.map(({ hasGif, hasVoice, ...row }) => ({
       ...row,
-      preview: row.preview === null ? null : notificationPreview(row.preview, hasGif),
+      preview: row.preview === null ? null : notificationPreview(row.preview, hasGif, hasVoice),
     })),
     unreadCount: count.value,
     nextCursor:

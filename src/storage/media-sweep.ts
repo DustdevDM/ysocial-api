@@ -1,7 +1,7 @@
 import { ListObjectsV2Command } from "@aws-sdk/client-s3";
-import { inArray } from "drizzle-orm";
+import { inArray, sql } from "drizzle-orm";
 import { db } from "../db/index.ts";
-import { users, mediaDeletions } from "../db/schema.ts";
+import { users, posts, mediaDeletions } from "../db/schema.ts";
 import { requireAvatarStorage } from "./r2.ts";
 
 export async function sweepUnusedMedia(remove = false, database = db) {
@@ -11,6 +11,7 @@ export async function sweepUnusedMedia(remove = false, database = db) {
   for (const media of [
     { prefix: "avatars/", column: users.avatarKey },
     { prefix: "banners/", column: users.bannerKey },
+    { prefix: "voices/", column: sql<string>`${posts.voice}->>'key'` },
   ]) {
     let continuationToken: string | undefined;
     do {
@@ -24,7 +25,7 @@ export async function sweepUnusedMedia(remove = false, database = db) {
       );
       const candidates = (page.Contents ?? []).flatMap((object) =>
         object.Key &&
-        /^(avatars|banners)\/[a-f0-9-]{36}\.(avif|png|webp|gif|jpg)$/.test(
+        /^(avatars|banners|voices)\/[a-f0-9-]{36}\.(avif|png|webp|gif|jpg|m4a)$/.test(
           object.Key,
         ) &&
         object.LastModified &&
@@ -35,8 +36,8 @@ export async function sweepUnusedMedia(remove = false, database = db) {
       const saved = candidates.length
         ? await database
             .select({ key: media.column })
-            .from(users)
-            .where(inArray(media.column, candidates))
+            .from(media.prefix === "voices/" ? posts : users)
+            .where(inArray(sql<string>`${media.column}`, candidates))
         : [];
       const active = new Set(saved.map((row) => row.key));
       for (const key of candidates) {

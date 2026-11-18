@@ -29,6 +29,7 @@ import {
   postReposts,
   postTopics,
   posts,
+  mediaDeletions,
   users,
 } from "./db/schema.ts";
 import { requireUser, readViewerId } from "./auth/request.ts";
@@ -40,6 +41,8 @@ import { parseTopicName, syncPostTopics } from "./topics.ts";
 import { syncMentions } from "./mentions.ts";
 import { readGifSelection } from "./storage/klipy.ts";
 import { pollDefinitionSchema } from "./poll-schema.ts";
+import { flushMediaDeletions } from "./storage/media-lifecycle.ts";
+import { readVoiceSelection } from "./storage/voice-selection.ts";
 import { previewIconForPost, previewImageForPost, previewsForPost } from "./link-previews.ts";
 
 const router = Router();
@@ -61,9 +64,10 @@ const createSchema = contentSchema
     // Preserve compatibility with callers that send an empty attachment list.
     attachmentIds: z.array(z.uuid()).max(0).optional(),
     gifToken: z.string().min(1).max(4096).optional(),
+    voiceToken: z.string().min(1).max(4096).optional(),
     poll: pollDefinitionSchema.optional(),
   })
-  .refine(({ content, gifToken, poll }) => Boolean(content || gifToken || poll));
+  .refine(({ content, gifToken, poll, voiceToken }) => Boolean(content || gifToken || poll || voiceToken));
 const cursorSchema = z.strictObject({
   createdAt: z.iso.datetime(),
   id: z.uuid(),
@@ -88,7 +92,12 @@ async function createPost({
 }) {
   const selection = input.gifToken ? readGifSelection(input.gifToken, userId) : null;
   const gif = selection?.gif ?? null;
+  const voiceSelection = input.voiceToken ? readVoiceSelection(input.voiceToken, userId) : null;
+  const voice = voiceSelection?.voice ?? null;
   const id = await db.transaction(async (tx) => {
+    // Lock the staged upload against the cleanup worker. Only one post may claim it.
+    const [pendingVoice] = voice ? await tx.select().from(mediaDeletions)
+      .where(eq(mediaDeletions.key, voice.key)).for("update") : [];
     let parentAuthor: string | undefined;
     if (parentId) {
       const [parent] = await tx
@@ -100,7 +109,8 @@ async function createPost({
       parentAuthor = parent.authorId;
     }
     // An expired selection can confirm an earlier successful write by client ID.
-    const expired = selection && selection.expires < Date.now();
+    const expired = Boolean((selection && selection.expires < Date.now()) ||
+      (voiceSelection && (voiceSelection.expires < Date.now() || !pendingVoice || pendingVoice.availableAt.getTime() <= Date.now())));
     const [saved] = expired
       ? []
       : await tx
@@ -110,12 +120,14 @@ async function createPost({
             authorId: userId,
             content: input.content,
             gif,
+            voice,
             poll: input.poll,
             parentId,
           })
           .onConflictDoNothing({ target: posts.id })
           .returning({ id: posts.id });
     if (saved) {
+      if (voice) await tx.delete(mediaDeletions).where(eq(mediaDeletions.key, voice.key));
       await syncMentions(tx, saved.id, userId, input.content);
       await syncPostTopics(tx, saved.id, input.content);
       if (parentAuthor)
@@ -129,7 +141,7 @@ async function createPost({
       return saved.id;
     }
     if (!input.clientId) {
-      if (expired) throw new AuthError(400, "invalid_gif_selection");
+      if (expired) throw new AuthError(400, voice ? "invalid_voice_selection" : "invalid_gif_selection");
       throw new Error("Post ID collision");
     }
     const [existing] = await tx
@@ -139,6 +151,7 @@ async function createPost({
         parentId: posts.parentId,
         content: posts.content,
         gif: posts.gif,
+        voice: posts.voice,
         poll: posts.poll,
       })
       .from(posts)
@@ -150,12 +163,13 @@ async function createPost({
       existing.parentId !== parentId ||
       existing.content !== input.content ||
       existing.gif?.url !== gif?.url ||
+      existing.voice?.key !== voice?.key ||
       savedPoll?.title !== input.poll?.title ||
       savedPoll?.anonymous !== input.poll?.anonymous ||
       !isDeepStrictEqual(savedPoll?.options, input.poll?.options)
     )
       throw expired
-        ? new AuthError(400, "invalid_gif_selection")
+        ? new AuthError(400, voice ? "invalid_voice_selection" : "invalid_gif_selection")
         : new AuthError(409, "post_id_conflict");
     return existing.id;
   });
@@ -608,6 +622,7 @@ router.patch("/:id", async (req, res) => {
         authorId: posts.authorId,
         content: posts.content,
         gif: posts.gif,
+        voice: posts.voice,
         poll: posts.poll,
         createdAt: posts.createdAt,
         editedAt: posts.editedAt,
@@ -618,7 +633,7 @@ router.patch("/:id", async (req, res) => {
     if (!existing) throw new AuthError(404, "post_not_found");
     if (existing.authorId !== user.id)
       throw new AuthError(403, "not_post_author");
-    if (!parsed.data.content && !existing.gif && !existing.poll)
+    if (!parsed.data.content && !existing.gif && !existing.poll && !existing.voice)
       throw new AuthError(400, "invalid_content");
     const [saved] = await tx
       .update(posts)
@@ -651,11 +666,12 @@ router.delete("/:id", async (req, res) => {
   const [deleted] = await db
     .delete(posts)
     .where(and(eq(posts.id, req.params.id), eq(posts.authorId, user.id)))
-    .returning({ id: posts.id });
+    .returning({ id: posts.id, voice: posts.voice });
   if (!deleted) {
     await findPost(req.params.id);
     throw new AuthError(403, "not_post_author");
   }
+  if (deleted.voice) await flushMediaDeletions(deleted.voice.key);
   res.status(204).end();
 });
 export default router;

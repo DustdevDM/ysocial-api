@@ -162,6 +162,27 @@
       "when": 1794994918317,
       "tag": "0022_post_polls",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1795026317236,
+      "tag": "0023_lame_leopardon",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1795026317237,
+      "tag": "0024_voice_draft_expiry",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1795039681555,
+      "tag": "0025_voice_jobs",
+      "breakpoints": true
     }
   ]
 }

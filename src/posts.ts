@@ -307,7 +307,6 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
   // clients can show it in context instead of as a stray post.
   const ancestors = topic ? await loadAncestors(page, viewerId) : undefined;
   res.json({
-    posts: page.map(serializePost),
     repostedBy: {},
     posts: page.map((row) =>
       ancestors

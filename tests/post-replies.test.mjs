@@ -49,12 +49,12 @@ test("post and reply flows", async (t) => {
     server = app.listen(0, "127.0.0.1");
     await once(server, "listening");
     const base = `http://127.0.0.1:${server.address().port}`;
-    async function request(path, method = "GET", body) {
+    async function request(path, method = "GET", body, sessionToken = token) {
       return fetch(base + path, {
         method,
         headers: {
           Origin: env.APP_ORIGIN,
-          Cookie: `session=${token}`,
+          ...(sessionToken ? { Cookie: `session=${sessionToken}` } : {}),
           "Content-Type": "application/json",
         },
         body: body === undefined ? undefined : JSON.stringify(body),
@@ -169,11 +169,13 @@ test("post and reply flows", async (t) => {
       assert.equal((await send({ clientId: randomUUID(), gifToken: expiredToken })).status, 400);
 
       const path = `/api/posts/${post.id}`;
-      const reply = await request(`${path}/replies`, "POST", { content: " #hello ", gifToken });
+      const poll = { title: "Which greeting?", options: ["Wave", "High five"] };
+      const reply = await request(`${path}/replies`, "POST", { content: " #hello ", gifToken, poll });
       assert.equal(reply.status, 201);
       const { post: child } = await reply.json();
       assert.equal(child.content, "#hello");
       assert.deepEqual(child.gif, post.gif);
+      assert.equal(child.poll.title, poll.title);
 
       for (const content of ["Caption", ""]) {
         const edited = await request(path, "PATCH", { content });
@@ -191,6 +193,119 @@ test("post and reply flows", async (t) => {
       const thread = await get(`${path}/thread`);
       assert.deepEqual(thread.post.gif, post.gif);
       assert.deepEqual(thread.replies[0].gif, child.gif);
+      assert.deepEqual(thread.replies[0].poll, child.poll);
+
+      const gifPoll = await send({ gifToken, poll });
+      assert.equal(gifPoll.status, 201);
+      const { post: combined } = await gifPoll.json();
+      assert.equal(combined.content, "");
+      assert.deepEqual(combined.gif, post.gif);
+      assert.equal(combined.poll.title, poll.title);
+      assert.equal(combined.poll.anonymous, false);
+    });
+
+    await t.test("polls respect privacy and allow each account to change its vote", async () => {
+      const poll = { title: "  Choose a color  ", options: [" Red ", "Blue"], anonymous: true };
+      const send = (body) => request("/api/posts", "POST", body);
+      for (const invalid of [
+        { options: poll.options },
+        { ...poll, title: "  " },
+        { ...poll, options: ["One"] },
+        { ...poll, options: ["Red", " red "] },
+      ]) {
+        assert.equal((await send({ content: "Caption", poll: invalid })).status, 400);
+      }
+      const clientId = randomUUID();
+      const created = await send({ clientId, poll, content: "Caption" });
+      assert.equal(created.status, 201);
+      const { post } = await created.json();
+      assert.deepEqual(post.poll, {
+        title: "Choose a color",
+        options: [{ label: "Red", votes: 0 }, { label: "Blue", votes: 0 }],
+        anonymous: true,
+        allowRevote: true,
+        selectedOption: null,
+      });
+      assert.equal((await send({ clientId, poll, content: "Caption" })).status, 201);
+      assert.equal((await send({
+        clientId, content: "Caption", poll: { ...poll, anonymous: false },
+      })).status, 409);
+      const path = `/api/posts/${post.id}`;
+      assert.equal((await request(path, "PATCH", { content: "" })).status, 200);
+      const vote = (index, sessionToken) =>
+        request(`${path}/poll/vote`, "PUT", { optionIndex: index }, sessionToken);
+      assert.equal((await vote(0, null)).status, 401);
+      assert.equal((await vote(2)).status, 400);
+      const votes = await Promise.all([vote(0), vote(1)]);
+      assert.deepEqual(votes.map(({ status }) => status), [200, 200]);
+      const savedVote = (await get(path)).post.poll;
+      assert.equal(savedVote.options.reduce((sum, option) => sum + option.votes, 0), 1);
+      assert.equal(savedVote.allowRevote, true);
+      assert.equal((await vote(savedVote.selectedOption)).status, 200);
+      assert.equal((await request(`${path}/poll/voters?option=${savedVote.selectedOption}`)).status, 403);
+      assert.equal((await request(`${path}/poll/voters?option=0&option=1`)).status, 403);
+      assert.equal((await request(`${path}/poll/voters`)).status, 403);
+      const visitor = await request(path, "GET", undefined, null);
+      assert.deepEqual((await visitor.json()).post.poll, { ...savedVote, selectedOption: null });
+      const batchPath = `/api/posts/poll-results?ids=${post.id},${randomUUID()}`;
+      const batch = await get(batchPath);
+      assert.deepEqual(batch, { viewerId: user.id, results: [{ id: post.id, poll: savedVote }] });
+      const guestBatch = await request(batchPath, "GET", undefined, null);
+      assert.deepEqual(await guestBatch.json(), {
+        viewerId: null,
+        results: [{ id: post.id, poll: { ...savedVote, selectedOption: null } }],
+      });
+      assert.equal((await request("/api/posts/poll-results?ids=invalid")).status, 400);
+      const feed = await get("/api/posts");
+      assert.deepEqual(feed.posts.find((entry) => entry.id === post.id).poll, savedVote);
+      const profile = await get("/api/profiles/reply_author");
+      assert.deepEqual(profile.posts.find((entry) => entry.id === post.id).poll, savedVote);
+
+      const open = await send({
+        poll: { ...poll, options: [...poll.options, "Green"], anonymous: false },
+      });
+      assert.equal(open.status, 201);
+      const { post: publicPost } = await open.json();
+      const publicPath = `/api/posts/${publicPost.id}`;
+      async function publicVote(optionIndex, sessionToken) {
+        const response = await request(`${publicPath}/poll/vote`, "PUT", { optionIndex }, sessionToken);
+        assert.equal(response.status, 200);
+        return (await response.json()).poll;
+      }
+      const { rows: [voter] } = await pool.query(
+        "INSERT INTO users (handle) VALUES ('other_voter') RETURNING id",
+      );
+      const { rows: [otherIdentity] } = await pool.query(
+        "INSERT INTO auth_identities (issuer, subject, user_id) VALUES ('https://test.invalid', 'other-voter', $1) RETURNING id",
+        [voter.id],
+      );
+      const otherToken = randomUUID();
+      await pool.query(
+        "INSERT INTO auth_sessions (token_hash, identity_id, encrypted_tokens, refresh_after, expires_at) VALUES ($1, $2, 'unused', now() + interval '1 day', now() + interval '2 days')",
+        [hash(otherToken), otherIdentity.id],
+      );
+      await publicVote(0);
+      await publicVote(0, otherToken);
+      const revised = await publicVote(1);
+      assert.equal(revised.selectedOption, 1);
+      assert.deepEqual(revised.options.map(({ votes }) => votes), [1, 1, 0]);
+      assert.deepEqual((await get(`${publicPath}/poll/voters?option=0`)).users.map(({ id }) => id), [voter.id]);
+      assert.deepEqual((await get(`${publicPath}/poll/voters?option=1`)).users.map(({ id }) => id), [user.id]);
+      const publicVoters = await get(`${publicPath}/poll/voters`);
+      const redOrBlue = await get(`${publicPath}/poll/voters?option=0&option=1`);
+      assert.deepEqual(redOrBlue, publicVoters);
+      const blueOrGreen = await get(`${publicPath}/poll/voters?option=1&option=2`);
+      assert.deepEqual(blueOrGreen.users.map(({ id }) => id), [user.id]);
+      assert.equal((await request(`${publicPath}/poll/voters?option=1&option=3`)).status, 400);
+      assert.deepEqual(
+        new Map(publicVoters.users.map(({ id, optionLabel }) => [id, optionLabel])),
+        new Map([[voter.id, "Red"], [user.id, "Blue"]]),
+      );
+      const otherView = await request(publicPath, "GET", undefined, otherToken);
+      assert.equal((await otherView.json()).post.poll.selectedOption, 0);
+      assert.equal((await request(publicPath, "DELETE")).status, 204);
+      const remaining = await pool.query("SELECT 1 FROM poll_votes WHERE post_id = $1", [publicPost.id]);
+      assert.equal(remaining.rowCount, 0);
     });
   } finally {
     if (server) await new Promise((resolve) => server.close(resolve));

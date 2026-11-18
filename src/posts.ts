@@ -42,6 +42,8 @@ import { AuthError } from "./auth/provider.ts";
 import { userSelection } from "./user-data.ts";
 import { recordNotification } from "./notification-events.ts";
 import { parseTopicName, syncPostTopics } from "./topics.ts";
+import { extractTopics } from "./topics-text.ts";
+import { publishLivePost } from "./live-events.ts";
 
 import { syncMentions } from "./mentions.ts";
 import { readGifSelection } from "./storage/klipy.ts";
@@ -142,6 +144,12 @@ async function createPost({
     if (saved) {
       await syncMentions(tx, saved.id, userId, input.content);
       await syncPostTopics(tx, saved.id, input.content);
+      await publishLivePost(tx, {
+        id: saved.id,
+        parentId,
+        authorId: userId,
+        topics: extractTopics(input.content),
+      });
       if (parentAuthor)
         await recordNotification(tx, {
           recipientId: parentAuthor,

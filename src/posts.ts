@@ -4,6 +4,7 @@ import {
   serializePost,
   reactionSelection,
   repostSelection,
+  pollSelection,
 } from "./post-data.ts";
 import { Router, type Request } from "express";
 import {
@@ -19,9 +20,11 @@ import {
   sql,
 } from "drizzle-orm";
 import { z } from "zod";
+import { isDeepStrictEqual } from "node:util";
 import { db } from "./db/index.ts";
 import {
   postEdits,
+  pollVotes,
   postLikes,
   postReposts,
   postTopics,
@@ -36,6 +39,7 @@ import { parseTopicName, syncPostTopics } from "./topics.ts";
 
 import { syncMentions } from "./mentions.ts";
 import { readGifSelection } from "./storage/klipy.ts";
+import { pollDefinitionSchema } from "./poll-schema.ts";
 
 const router = Router();
 const contentSchema = z.strictObject({
@@ -55,8 +59,9 @@ const createSchema = contentSchema
     // Preserve compatibility with callers that send an empty attachment list.
     attachmentIds: z.array(z.uuid()).max(0).optional(),
     gifToken: z.string().min(1).max(4096).optional(),
+    poll: pollDefinitionSchema.optional(),
   })
-  .refine(({ content, gifToken }) => Boolean(content || gifToken));
+  .refine(({ content, gifToken, poll }) => Boolean(content || gifToken || poll));
 const cursorSchema = z.strictObject({
   createdAt: z.iso.datetime(),
   id: z.uuid(),
@@ -103,6 +108,7 @@ async function createPost({
             authorId: userId,
             content: input.content,
             gif,
+            poll: input.poll,
             parentId,
           })
           .onConflictDoNothing({ target: posts.id })
@@ -131,15 +137,20 @@ async function createPost({
         parentId: posts.parentId,
         content: posts.content,
         gif: posts.gif,
+        poll: posts.poll,
       })
       .from(posts)
       .where(eq(posts.id, input.clientId));
+    const savedPoll = existing?.poll;
     if (
       !existing ||
       existing.authorId !== userId ||
       existing.parentId !== parentId ||
       existing.content !== input.content ||
-      existing.gif?.url !== gif?.url
+      existing.gif?.url !== gif?.url ||
+      savedPoll?.title !== input.poll?.title ||
+      savedPoll?.anonymous !== input.poll?.anonymous ||
+      !isDeepStrictEqual(savedPoll?.options, input.poll?.options)
     )
       throw expired
         ? new AuthError(400, "invalid_gif_selection")
@@ -220,6 +231,20 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
   });
 };
 router.get("/", listPosts);
+router.get("/poll-results", async (req, res) => {
+  const parsed = z.strictObject({
+    ids: z.string().max(50 * 37).transform((value) => value.split(","))
+      .pipe(z.array(z.uuid()).min(1).max(50)),
+  }).safeParse(req.query);
+  if (!parsed.success) throw new AuthError(400, "invalid_post_id");
+
+  const viewerId = await readViewerId(req);
+  const results = await db
+    .select({ id: posts.id, poll: pollSelection(viewerId) })
+    .from(posts)
+    .where(and(inArray(posts.id, parsed.data.ids), sql`${posts.poll} is not null`));
+  res.json({ viewerId, results });
+});
 router.post("/", async (req, res) => {
   const user = await requireUser(req);
   const parsed = createSchema.safeParse(req.body);
@@ -316,6 +341,79 @@ router.get("/:id/edits", async (req, res) => {
   });
 });
 router.get("/:id/replies", listPosts);
+const pollOptionSchema = z.number().int().min(0).max(5);
+router.put("/:id/poll/vote", async (req, res) => {
+  const user = await requireUser(req);
+  const parsed = z.strictObject({ optionIndex: pollOptionSchema }).safeParse(req.body);
+  if (!parsed.success) throw new AuthError(400, "invalid_poll_option");
+  const postId = req.params.id;
+  const { optionIndex } = parsed.data;
+  const poll = await db.transaction(async (tx) => {
+    const [post] = await tx
+      .select({ poll: posts.poll })
+      .from(posts)
+      .where(eq(posts.id, postId))
+      .for("update");
+    if (!post?.poll) throw new AuthError(404, "poll_not_found");
+    if (optionIndex >= post.poll.options.length)
+      throw new AuthError(400, "invalid_poll_option");
+
+    await tx
+      .insert(pollVotes)
+      .values({ postId, userId: user.id, optionIndex })
+      .onConflictDoUpdate({
+        target: [pollVotes.postId, pollVotes.userId],
+        set: { optionIndex },
+      });
+
+    const [result] = await tx
+      .select({ poll: pollSelection(user.id) })
+      .from(posts)
+      .where(eq(posts.id, postId));
+    return result.poll;
+  });
+  res.json({ poll });
+});
+router.get("/:id/poll/voters", async (req, res) => {
+  const parsed = z.strictObject({
+    option: z.preprocess(
+      (value) => typeof value === "string" ? [value] : value,
+      z.array(z.string().regex(/^[0-5]$/).transform(Number)).min(1).max(6).optional(),
+    ),
+    cursor: z.uuid().optional(),
+  }).safeParse(req.query);
+  if (!parsed.success) throw new AuthError(400, "invalid_poll_option");
+  const { option: selectedOptions, cursor } = parsed.data;
+  const [post] = await db
+    .select({ poll: posts.poll })
+    .from(posts)
+    .where(eq(posts.id, req.params.id));
+  if (!post?.poll) throw new AuthError(404, "poll_not_found");
+  if (post.poll.anonymous) throw new AuthError(403, "poll_is_anonymous");
+  const { options } = post.poll;
+  if (selectedOptions?.some((index) => index >= options.length))
+    throw new AuthError(400, "invalid_poll_option");
+
+  const rows = await db
+    .select({ ...userSelection, optionIndex: pollVotes.optionIndex })
+    .from(pollVotes)
+    .innerJoin(users, eq(users.id, pollVotes.userId))
+    .where(and(
+      eq(pollVotes.postId, req.params.id),
+      selectedOptions ? inArray(pollVotes.optionIndex, selectedOptions) : undefined,
+      cursor ? gt(pollVotes.userId, cursor) : undefined,
+    ))
+    .orderBy(asc(pollVotes.userId))
+    .limit(51);
+  const page = rows.slice(0, 50);
+  res.json({
+    users: page.map(({ optionIndex, ...user }) => ({
+      ...user,
+      optionLabel: options[optionIndex],
+    })),
+    nextCursor: rows.length > 50 ? (page.at(-1)?.id ?? null) : null,
+  });
+});
 router.get("/:id/activity", async (req, res) => {
   const query = z
     .object({
@@ -459,6 +557,7 @@ router.patch("/:id", async (req, res) => {
         authorId: posts.authorId,
         content: posts.content,
         gif: posts.gif,
+        poll: posts.poll,
         createdAt: posts.createdAt,
         editedAt: posts.editedAt,
       })
@@ -468,7 +567,7 @@ router.patch("/:id", async (req, res) => {
     if (!existing) throw new AuthError(404, "post_not_found");
     if (existing.authorId !== user.id)
       throw new AuthError(403, "not_post_author");
-    if (!parsed.data.content && !existing.gif)
+    if (!parsed.data.content && !existing.gif && !existing.poll)
       throw new AuthError(400, "invalid_content");
     const [saved] = await tx
       .update(posts)

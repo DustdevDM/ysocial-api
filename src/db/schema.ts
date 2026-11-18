@@ -1,5 +1,6 @@
 import type { BannerCrop } from "../storage/banner-crop.ts";
 import type { KlipyGif } from "../storage/klipy.ts";
+import type { PollDefinition } from "../poll-schema.ts";
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
@@ -102,6 +103,7 @@ export const posts = pgTable(
     }),
     content: text().notNull(),
     gif: jsonb().$type<KlipyGif>(),
+    poll: jsonb().$type<PollDefinition>(),
     createdAt: timestamp("created_at", { withTimezone: true, precision: 3 })
       .notNull()
       .defaultNow(),
@@ -116,8 +118,26 @@ export const posts = pgTable(
     index("posts_feed_idx").on(table.createdAt.desc(), table.id.desc()),
     check(
       "posts_content_check",
-      sql`char_length(${table.content}) <= 2000 AND (${table.content} ~ '[^[:space:]]' OR (${table.content} = '' AND ${table.gif} IS NOT NULL))`,
+      sql`char_length(${table.content}) <= 2000 AND (${table.content} ~ '[^[:space:]]' OR (${table.content} = '' AND (${table.gif} IS NOT NULL OR ${table.poll} IS NOT NULL)))`,
     ),
+  ],
+);
+
+export const pollVotes = pgTable(
+  "poll_votes",
+  {
+    postId: uuid("post_id")
+      .notNull()
+      .references(() => posts.id, { onDelete: "cascade" }),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    optionIndex: integer("option_index").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.postId, table.userId] }),
+    index("poll_votes_option_idx").on(table.postId, table.optionIndex, table.userId),
+    index("poll_votes_user_idx").on(table.userId),
   ],
 );
 

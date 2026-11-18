@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import { postLikes, postReposts, posts } from "./db/schema.ts";
 import { userSelection } from "./user-data.ts";
+import type { PollDefinition } from "./poll-schema.ts";
 
 export const postFields = {
   id: posts.id,
@@ -27,6 +28,29 @@ export function repostSelection(viewerId: string | null) {
         ? sql<boolean>`false`
         : sql<boolean>`exists(select 1 from ${postReposts} where ${postReposts.postId} = ${posts.id} and ${postReposts.userId} = ${viewerId})`,
   };
+}
+type PollResult = Omit<PollDefinition, "options"> & {
+  allowRevote: true;
+  options: { label: string; votes: number }[];
+  selectedOption: number | null;
+};
+
+export function pollSelection(viewerId: string | null) {
+  const selectedOption = viewerId === null ? sql`null` : sql`(
+    select option_index from poll_votes where post_id = ${posts.id} and user_id = ${viewerId}
+  )`;
+  return sql<PollResult | null>`case when ${posts.poll} is not null then
+    ${posts.poll} || jsonb_build_object('allowRevote', true, 'selectedOption', ${selectedOption}, 'options', (
+      select jsonb_agg(jsonb_build_object(
+        'label', option.label, 'votes', coalesce(tally.votes, 0)
+      ) order by option.position)
+      from jsonb_array_elements_text(${posts.poll}->'options') with ordinality as option(label, position)
+      left join (
+        select option_index, count(*)::int as votes
+        from poll_votes where post_id = ${posts.id} group by option_index
+      ) tally on tally.option_index = option.position - 1
+    ))
+  end`;
 }
 // "Friends" are mutual follows. Friends who liked a post are surfaced under it.
 const friendLikeFilter = (viewerId: string) => sql`
@@ -59,6 +83,7 @@ export const postSelection = (viewerId: string | null) => ({
   ...friendLikeSelection(viewerId),
   ...repostSelection(viewerId),
   ...postFields,
+  poll: pollSelection(viewerId),
   mentions: sql<{ id: string; handle: string; username: string }[]>`(
     select coalesce(json_agg(json_build_object('id', u.id, 'handle', u.handle, 'username', m.handle)), '[]'::json)
     from post_mentions m join users u on u.id = m.user_id where m.post_id = ${posts.id}

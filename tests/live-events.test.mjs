@@ -179,6 +179,58 @@ test("live post stream", async (t) => {
       again.controller.abort();
     });
 
+    await t.test("announces reactions, edits and deletions with the posts they touch", async () => {
+      const root = await create("Root");
+      const reply = await create("Reply", root.id);
+      const nested = await create("Nested", reply.id);
+      const { stream, controller } = await open();
+      assert.equal((await request(`/api/posts/${nested.id}/like`, "PUT")).status, 200);
+      assert.deepEqual(await stream.event("change"), { ids: [nested.id] });
+      assert.equal((await request(`/api/posts/${nested.id}/like`, "DELETE")).status, 200);
+      assert.deepEqual(await stream.event("change"), { ids: [nested.id] });
+      assert.equal((await request(`/api/posts/${root.id}/repost`, "PUT", {})).status, 200);
+      assert.deepEqual(await stream.event("change"), { ids: [root.id] });
+      assert.deepEqual(await stream.event("post"), {
+        id: root.id,
+        parentId: null,
+        authorId: user.id,
+        topics: [],
+        reposted: true,
+      });
+      const deeper = await create("Deeper", nested.id);
+      assert.equal((await stream.event("post")).id, deeper.id);
+      assert.deepEqual(
+        new Set((await stream.event("change")).ids),
+        new Set([deeper.id, nested.id, reply.id, root.id]),
+      );
+      assert.equal((await request(`/api/posts/${deeper.id}`, "PATCH", { content: "Deeper edit" })).status, 200);
+      assert.deepEqual(
+        new Set((await stream.event("change")).ids),
+        new Set([deeper.id, nested.id, reply.id, root.id]),
+      );
+      assert.equal((await request(`/api/posts/${deeper.id}`, "DELETE")).status, 204);
+      assert.deepEqual(
+        new Set((await stream.event("change")).ids),
+        new Set([deeper.id, nested.id, reply.id, root.id]),
+      );
+      controller.abort();
+    });
+
+    await t.test("returns fresh state for the posts asked about", async () => {
+      const post = await create("State check");
+      await request(`/api/posts/${post.id}/like`, "PUT");
+      const gone = randomUUID();
+      const response = await request(`/api/posts/states?ids=${post.id},${gone}`);
+      assert.equal(response.status, 200);
+      const body = await response.json();
+      assert.equal(body.viewerId, user.id);
+      assert.equal(body.posts.length, 1);
+      assert.equal(body.posts[0].id, post.id);
+      assert.equal(body.posts[0].likes, 1);
+      assert.equal(body.posts[0].liked, true);
+      assert.equal((await request("/api/posts/states?ids=nope")).status, 400);
+    });
+
     await t.test("ends open streams when live events stop", async () => {
       const { stream } = await open();
       stop();

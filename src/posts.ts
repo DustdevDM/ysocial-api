@@ -43,7 +43,7 @@ import { userSelection } from "./user-data.ts";
 import { recordNotification } from "./notification-events.ts";
 import { parseTopicName, syncPostTopics } from "./topics.ts";
 import { extractTopics } from "./topics-text.ts";
-import { publishLivePost } from "./live-events.ts";
+import { affectedPostIds, publishLiveChange, publishLivePost } from "./live-events.ts";
 
 import { syncMentions } from "./mentions.ts";
 import { readGifSelection } from "./storage/klipy.ts";
@@ -150,6 +150,7 @@ async function createPost({
         authorId: userId,
         topics: extractTopics(input.content),
       });
+      await publishLiveChange(tx, await affectedPostIds(tx, saved.id));
       if (parentAuthor)
         await recordNotification(tx, {
           recipientId: parentAuthor,
@@ -348,6 +349,20 @@ router.get("/poll-results", async (req, res) => {
     .where(and(inArray(posts.id, parsed.data.ids), sql`${posts.poll} is not null`));
   res.json({ viewerId, results });
 });
+router.get("/states", async (req, res) => {
+  const parsed = z.strictObject({
+    ids: z.string().max(50 * 37).transform((value) => value.split(","))
+      .pipe(z.array(z.uuid()).min(1).max(50)),
+  }).safeParse(req.query);
+  if (!parsed.success) throw new AuthError(400, "invalid_post_id");
+  const viewerId = await readViewerId(req);
+  const rows = await db
+    .select(postSelection(viewerId))
+    .from(posts)
+    .innerJoin(users, eq(users.id, posts.authorId))
+    .where(inArray(posts.id, parsed.data.ids));
+  res.json({ viewerId, posts: rows.map((row) => serializePost(row)) });
+});
 router.post("/", async (req, res) => {
   const user = await requireUser(req);
   const parsed = createSchema.safeParse(req.body);
@@ -522,6 +537,7 @@ router.put("/:id/poll/vote", async (req, res) => {
         set: { optionIndex },
       });
 
+    await publishLiveChange(tx, [postId]);
     const [result] = await tx
       .select({ poll: pollSelection(user.id) })
       .from(posts)
@@ -667,6 +683,7 @@ async function setLike(req: Request, liked: boolean) {
         .delete(postLikes)
         .where(and(eq(postLikes.postId, id), eq(postLikes.userId, user.id)));
     }
+    await publishLiveChange(tx, [id]);
     const [state] = await tx
       .select(reactionSelection(user.id))
       .from(posts)
@@ -693,7 +710,7 @@ async function setRepost(req: Request, reposted: boolean) {
   const { audience } = body.data;
   return db.transaction(async (tx) => {
     const [post] = await tx
-      .select({ id: posts.id, authorId: posts.authorId })
+      .select({ id: posts.id, authorId: posts.authorId, parentId: posts.parentId })
       .from(posts)
       .where(eq(posts.id, id))
       .for("update");
@@ -739,6 +756,15 @@ async function setRepost(req: Request, reposted: boolean) {
           and(eq(postReposts.postId, id), eq(postReposts.userId, user.id)),
         );
     }
+    await publishLiveChange(tx, [id]);
+    if (reposted)
+      await publishLivePost(tx, {
+        id,
+        parentId: post.parentId,
+        authorId: user.id,
+        topics: [],
+        reposted: true,
+      });
     const [state] = await tx
       .select(repostSelection(user.id))
       .from(posts)
@@ -794,6 +820,7 @@ router.patch("/:id", async (req, res) => {
         versionAt: existing.editedAt ?? existing.createdAt,
       });
     await syncMentions(tx, saved.id, user.id, parsed.data.content);
+    await publishLiveChange(tx, await affectedPostIds(tx, saved.id));
     return saved;
   });
   res.json({
@@ -803,10 +830,15 @@ router.patch("/:id", async (req, res) => {
 });
 router.delete("/:id", async (req, res) => {
   const user = await requireUser(req);
-  const [deleted] = await db
-    .delete(posts)
-    .where(and(eq(posts.id, req.params.id), eq(posts.authorId, user.id)))
-    .returning({ id: posts.id });
+  const [deleted] = await db.transaction(async (tx) => {
+    const affected = await affectedPostIds(tx, req.params.id);
+    const removed = await tx
+      .delete(posts)
+      .where(and(eq(posts.id, req.params.id), eq(posts.authorId, user.id)))
+      .returning({ id: posts.id });
+    if (removed.length) await publishLiveChange(tx, affected);
+    return removed;
+  });
   if (!deleted) {
     await findPost(req.params.id);
     throw new AuthError(403, "not_post_author");

@@ -352,7 +352,6 @@ await test("avatar upload, persistence, access, and failures", async (t) => {
         assert.equal(result.status, 200);
         assert.notEqual(data.avatarUrl, firstUrl);
         assert.equal((await fetch(`${origin}${firstUrl}`)).status, 404);
-        await assertObjectDeleted(firstUrl.replace("/api/", ""));
         assert.equal((await fetch(`${origin}${data.avatarUrl}`)).status, 200);
         assert.equal(
           (await fetch(`${origin}/api/avatars/not-a-key.png`)).status,
@@ -360,6 +359,127 @@ await test("avatar upload, persistence, access, and failures", async (t) => {
         );
       },
     );
+    await t.test("recent pictures: list, access, switch and remove", async () => {
+      const json = { ...headers, "Content-Type": "application/json" };
+      const recent = () =>
+        fetch(`${origin}/api/avatars/recent`, { headers }).then((res) =>
+          res.json(),
+        );
+      const session = () =>
+        fetch(`${origin}/auth/me`, { headers }).then((res) => res.json());
+      const current = (await session()).avatarUrl;
+      const before = (await recent()).avatars;
+      assert.ok(before.length >= 1);
+      assert.ok(before.every((item) => item.avatarUrl !== current));
+      assert.equal(
+        (await fetch(`${origin}/api/avatars/recent`)).status,
+        401,
+      );
+      const target = before[0];
+      assert.match(target.id, /^[a-f0-9-]{36}\.(avif|png)$/);
+      assert.equal(target.avatarUrl, `/api/avatars/${target.id}`);
+      assert.equal(
+        (await fetch(`${origin}${target.avatarUrl}`)).status,
+        404,
+      );
+      const owned = await fetch(`${origin}${target.avatarUrl}`, { headers });
+      assert.equal(owned.status, 200);
+      assert.match(owned.headers.get("cache-control"), /^private/);
+      assert.equal(
+        (
+          await fetch(`${origin}/api/avatars/recent/${target.id}`, {
+            method: "POST",
+            headers: { ...json, Origin: "https://other.invalid" },
+          })
+        ).status,
+        403,
+      );
+      assert.equal(
+        (
+          await fetch(`${origin}/api/avatars/recent/${randomUUID()}.avif`, {
+            method: "POST",
+            headers: json,
+          })
+        ).status,
+        404,
+      );
+      const switched = await fetch(
+        `${origin}/api/avatars/recent/${target.id}`,
+        { method: "POST", headers: json },
+      );
+      assert.equal(switched.status, 200);
+      assert.equal((await switched.json()).avatarUrl, target.avatarUrl);
+      assert.equal((await session()).avatarUrl, target.avatarUrl);
+      assert.equal(
+        (await fetch(`${origin}${target.avatarUrl}`)).status,
+        200,
+      );
+      const after = (await recent()).avatars;
+      assert.equal(after.length, before.length);
+      assert.ok(after.some((item) => item.avatarUrl === current));
+      assert.ok(after.every((item) => item.avatarUrl !== target.avatarUrl));
+      assert.equal(
+        (
+          await fetch(`${origin}/api/avatars/recent/${target.id}`, {
+            method: "DELETE",
+            headers,
+          })
+        ).status,
+        409,
+      );
+      const victim = after[0];
+      const removed = await fetch(
+        `${origin}/api/avatars/recent/${victim.id}`,
+        { method: "DELETE", headers },
+      );
+      assert.equal(removed.status, 204);
+      await assertObjectDeleted(victim.avatarUrl.replace("/api/", ""));
+      assert.equal(
+        (await fetch(`${origin}${victim.avatarUrl}`, { headers })).status,
+        404,
+      );
+      assert.equal(
+        (
+          await fetch(`${origin}/api/avatars/recent/${victim.id}`, {
+            method: "DELETE",
+            headers,
+          })
+        ).status,
+        404,
+      );
+      assert.ok(
+        (await recent()).avatars.every((item) => item.id !== victim.id),
+      );
+      const keys = [];
+      for (let index = 0; index < 8; index++) {
+        const { result, data } = await upload();
+        assert.equal(result.status, 200);
+        keys.push(data.avatarUrl.replace("/api/", ""));
+      }
+      const listed = (await recent()).avatars;
+      assert.equal(listed.length, 5);
+      assert.deepEqual(
+        listed.map((item) => `avatars/${item.id}`),
+        keys.slice(2, 7).reverse(),
+      );
+      const {
+        rows: [{ count }],
+      } = await pool.query(
+        "SELECT count(*)::int FROM avatar_history WHERE user_id = $1",
+        [alice.id],
+      );
+      assert.equal(count, 6);
+      for (const key of keys.slice(0, 2))
+        await assertObjectDeleted(key);
+      if (!live) {
+        for (const key of keys.slice(2)) assert.ok(objects.has(key));
+        const { sweepUnusedMedia } = await import("../src/storage/media-sweep.ts");
+        await sweepUnusedMedia(true);
+        const { flushMediaDeletions } = await import("../src/storage/media-lifecycle.ts");
+        await flushMediaDeletions();
+        for (const key of keys.slice(2)) assert.ok(objects.has(key));
+      }
+    });
     await t.test(
       "banner still image, animation, profile persistence, replacement, and removal",
       async () => {
@@ -500,9 +620,15 @@ await test("avatar upload, persistence, access, and failures", async (t) => {
             await import("../src/storage/media-lifecycle.ts");
           const old = (await upload()).data.avatarUrl.replace("/api/", "");
           assert.ok(objects.has(old));
-          failDeletes = true;
           const replacement = await upload();
           assert.equal(replacement.result.status, 200);
+          assert.ok(objects.has(old));
+          failDeletes = true;
+          const dropped = await fetch(
+            `${origin}/api/${old.replace("avatars/", "avatars/recent/")}`,
+            { method: "DELETE", headers },
+          );
+          assert.equal(dropped.status, 204);
           assert.ok(objects.has(old));
           const {
             rows: [queued],
@@ -558,11 +684,15 @@ await test("avatar upload, persistence, access, and failures", async (t) => {
           } = await pool.query("SELECT avatar_key FROM users WHERE id = $1", [
             alice.id,
           ]);
-          for (const item of uploads) {
-            const key = item.data.avatarUrl.replace("/api/", "");
-            assert.equal(objects.has(key), key === saved.avatar_key);
-          }
-          assert.equal(objects.has(current), false);
+          for (const item of uploads)
+            assert.ok(objects.has(item.data.avatarUrl.replace("/api/", "")));
+          const {
+            rows: [{ kept }],
+          } = await pool.query(
+            "SELECT count(*)::int AS kept FROM avatar_history WHERE key = $1",
+            [current],
+          );
+          assert.equal(objects.has(current), kept === 1);
           const stale = `banners/${randomUUID()}.gif`;
           objects.set(stale, picture);
           const { sweepUnusedMedia } =

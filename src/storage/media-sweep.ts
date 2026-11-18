@@ -1,7 +1,7 @@
 import { ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { inArray } from "drizzle-orm";
 import { db } from "../db/index.ts";
-import { users, mediaDeletions } from "../db/schema.ts";
+import { users, mediaDeletions, avatarHistory } from "../db/schema.ts";
 import { requireAvatarStorage } from "./r2.ts";
 
 export async function sweepUnusedMedia(remove = false, database = db) {
@@ -38,7 +38,14 @@ export async function sweepUnusedMedia(remove = false, database = db) {
             .from(users)
             .where(inArray(media.column, candidates))
         : [];
-      const active = new Set(saved.map((row) => row.key));
+      const recent =
+        candidates.length && media.prefix === "avatars/"
+          ? await database
+              .select({ key: avatarHistory.key })
+              .from(avatarHistory)
+              .where(inArray(avatarHistory.key, candidates))
+          : [];
+      const active = new Set([...saved, ...recent].map((row) => row.key));
       for (const key of candidates) {
         if (active.has(key)) continue;
         if (remove)

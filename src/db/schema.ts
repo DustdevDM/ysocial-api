@@ -269,6 +269,20 @@ export const mediaDeletions = pgTable(
   (table) => [index("media_deletions_due_idx").on(table.availableAt)],
 );
 
+export const avatarHistory = pgTable(
+  "avatar_history",
+  {
+    key: text().primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    usedAt: timestamp("used_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("avatar_history_user_idx").on(table.userId, table.usedAt.desc()),
+  ],
+);
+
 export const postMentions = pgTable("post_mentions", {
   postId: uuid("post_id").notNull().references(() => posts.id, { onDelete: "cascade" }),
   userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),

@@ -169,6 +169,13 @@
       "when": 1795009335268,
       "tag": "0023_reposts_and_quotes",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1795028932458,
+      "tag": "0024_avatar_history",
+      "breakpoints": true
     }
   ]
 }

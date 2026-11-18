@@ -162,6 +162,13 @@
       "when": 1794994918317,
       "tag": "0022_post_polls",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1795009335268,
+      "tag": "0023_reposts_and_quotes",
+      "breakpoints": true
     }
   ]
 }

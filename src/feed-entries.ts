@@ -1,0 +1,138 @@
+import { eq, inArray, sql } from "drizzle-orm";
+import { db } from "./db/index.ts";
+import { posts, users } from "./db/schema.ts";
+import { postSelection, repostVisibleSql, serializePost } from "./post-data.ts";
+import { userSelection } from "./user-data.ts";
+
+type FeedUser = { id: string; handle: string; displayName: string; avatarUrl: string | null };
+type Audience = "public" | "friends";
+type PostRecord = ReturnType<typeof serializePost<Awaited<ReturnType<typeof selectPosts>>[number]>>;
+
+/** Why a post is in a list as a repost: who shared it and how widely. */
+export type RepostContext = {
+  by: FeedUser;
+  audience: Audience;
+  /** Other people the viewer can see who also reposted this post. */
+  others: number;
+};
+/** Repost context for the posts of one list, keyed by post id. */
+export type RepostContexts = Record<string, RepostContext>;
+
+function selectPosts(ids: string[], viewerId: string | null) {
+  return db
+    .select(postSelection(viewerId))
+    .from(posts)
+    .innerJoin(users, eq(users.id, posts.authorId))
+    .where(inArray(posts.id, ids));
+}
+async function loadPosts(ids: string[], viewerId: string | null) {
+  if (!ids.length) return new Map<string, PostRecord>();
+  const rows = await selectPosts(ids, viewerId);
+  return new Map(rows.map((row) => [row.id, serializePost(row)]));
+}
+async function loadUsers(ids: string[]) {
+  if (!ids.length) return new Map<string, FeedUser>();
+  const rows = await db.select(userSelection).from(users).where(inArray(users.id, ids));
+  return new Map(rows.map((row) => [row.id, row]));
+}
+
+// Raw queries return timestamps as text, so activity times travel as epoch milliseconds.
+const epochMs = (column: ReturnType<typeof sql>) =>
+  sql`round(extract(epoch from ${column}) * 1000)::bigint::text`;
+type HomeRow = {
+  post_id: string;
+  at_ms: string;
+  reposter_id: string | null;
+  audience: Audience | null;
+  others: number | null;
+};
+/**
+ * The home feed. Every top-level post appears once, at its latest activity: its
+ * creation, or the newest repost the viewer may see. Reposted replies join the
+ * feed the same way. The response carries the posts in order, and the repost
+ * that surfaced each one (if any) in `repostedBy`.
+ */
+export async function homeFeed(
+  viewerId: string | null,
+  cursor: { createdAt: string; id: string } | undefined,
+  limit: number,
+) {
+  const activity = sql`coalesce(lr.created_at, p.created_at)`;
+  const { rows } = await db.execute<HomeRow>(sql`
+    select p.id as post_id, ${activity} as at, ${epochMs(activity)} as at_ms, lr.user_id as reposter_id,
+      lr.audience as audience, lr.n::int as others
+    from posts p
+    left join lateral (
+      select r.user_id, r.created_at, r.audience, count(*) over () - 1 as n
+      from post_reposts r
+      where r.post_id = p.id and ${repostVisibleSql(viewerId)}
+      order by r.created_at desc, r.user_id desc
+      limit 1
+    ) lr on true
+    where (p.parent_id is null or lr.user_id is not null)
+      ${
+        cursor
+          ? sql`and (${activity} < ${cursor.createdAt}::timestamptz
+              or (${activity} = ${cursor.createdAt}::timestamptz and p.id < ${cursor.id}::uuid))`
+          : sql``
+      }
+    order by at desc, p.id desc
+    limit ${limit + 1}
+  `);
+  const page = rows.slice(0, limit);
+  const [postsById, usersById] = await Promise.all([
+    loadPosts(page.map((row) => row.post_id), viewerId),
+    loadUsers([...new Set(page.flatMap((row) => (row.reposter_id ? [row.reposter_id] : [])))]),
+  ]);
+  const list: PostRecord[] = [];
+  const repostedBy: RepostContexts = {};
+  for (const row of page) {
+    const post = postsById.get(row.post_id);
+    if (!post) continue;
+    list.push(post);
+    const by = row.reposter_id ? usersById.get(row.reposter_id) : undefined;
+    if (by && row.audience)
+      repostedBy[post.id] = { by, audience: row.audience, others: row.others ?? 0 };
+  }
+  const last = page.at(-1);
+  return {
+    posts: list,
+    repostedBy,
+    nextCursor:
+      rows.length > limit && last
+        ? Buffer.from(JSON.stringify({ createdAt: new Date(Number(last.at_ms)).toISOString(), id: last.post_id })).toString("base64url")
+        : null,
+  };
+}
+
+type ProfileRow = { post_id: string; kind: "repost" | "quote"; audience: Audience | null };
+/**
+ * A profile's Reposts tab: what the person reposted (as the viewer may see it)
+ * and the quote posts they wrote, newest first. A quote is listed as its own
+ * post; a plain repost lists the original with the person as `repostedBy`.
+ */
+export async function profileReposts(profile: FeedUser, viewerId: string | null, limit = 20) {
+  const { rows } = await db.execute<ProfileRow>(sql`
+    select post_id, at, kind, audience from (
+      select r.post_id, r.created_at as at, 'repost' as kind, r.audience
+      from post_reposts r
+      where r.user_id = ${profile.id} and ${repostVisibleSql(viewerId)}
+      union all
+      select q.id, q.created_at, 'quote', null::text
+      from posts q where q.author_id = ${profile.id} and q.is_quote
+    ) e
+    order by at desc, post_id desc
+    limit ${limit}
+  `);
+  const postsById = await loadPosts(rows.map((row) => row.post_id), viewerId);
+  const list: PostRecord[] = [];
+  const repostedBy: RepostContexts = {};
+  for (const row of rows) {
+    const post = postsById.get(row.post_id);
+    if (!post) continue;
+    list.push(post);
+    if (row.kind === "repost" && row.audience)
+      repostedBy[post.id] = { by: profile, audience: row.audience, others: 0 };
+  }
+  return { posts: list, repostedBy };
+}

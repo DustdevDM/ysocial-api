@@ -16,6 +16,7 @@ import { notificationPreview } from "./notification-content.ts";
 const descriptions = {
   like: "liked your post",
   repost: "reposted your post",
+  quote: "quoted your post",
   reply: "replied to your post",
   follow: "followed you",
   mention: "mentioned you in a post",

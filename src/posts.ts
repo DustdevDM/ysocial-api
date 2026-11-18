@@ -40,8 +40,10 @@ import { parseTopicName, syncPostTopics } from "./topics.ts";
 import { syncMentions } from "./mentions.ts";
 import { readGifSelection } from "./storage/klipy.ts";
 import { pollDefinitionSchema } from "./poll-schema.ts";
+import { previewIconForPost, previewImageForPost, previewsForPost } from "./link-previews.ts";
 
 const router = Router();
+
 const contentSchema = z.strictObject({
   content: z
     .string()
@@ -264,6 +266,55 @@ router.get("/:id", async (req, res) => {
     post: await findPost(req.params.id, await readViewerId(req)),
     serverNow: new Date().toISOString(),
   });
+});
+async function postContent(id: string) {
+  const [post] = await db
+    .select({ content: posts.content })
+    .from(posts)
+    .where(eq(posts.id, id));
+  if (!post) throw new AuthError(404, "post_not_found");
+  return post.content;
+}
+router.get("/:id/link-previews", async (req, res) => {
+  const offset = req.query.offset ?? "0";
+  if (typeof offset !== "string" || !/^\d{1,4}$/.test(offset))
+    throw new AuthError(400, "invalid_cursor");
+  const content = await postContent(req.params.id);
+  res.json(await previewsForPost(content, Number(offset)));
+});
+const previewAssetHeaders = {
+  "Cache-Control": "public, max-age=3600",
+  "Cross-Origin-Resource-Policy": "same-origin",
+  "X-Content-Type-Options": "nosniff",
+};
+router.get("/:id/link-preview-image/:key", async (req, res) => {
+  if (!/^[0-9a-f]{64}$/.test(req.params.key)) {
+    res.sendStatus(404);
+    return;
+  }
+  const content = await postContent(req.params.id);
+  const image = await previewImageForPost(content, req.params.key);
+  if (!image) {
+    res.sendStatus(404);
+    return;
+  }
+  res.set(previewAssetHeaders).type("image/webp").send(image);
+});
+router.get("/:id/link-preview-icon/:key", async (req, res) => {
+  if (!/^[0-9a-f]{64}$/.test(req.params.key)) {
+    res.sendStatus(404);
+    return;
+  }
+  const icon = await previewIconForPost(await postContent(req.params.id), req.params.key);
+  if (!icon) {
+    res.sendStatus(404);
+    return;
+  }
+  // A directly opened SVG has an opaque origin and cannot execute or fetch resources.
+  res.set({
+    ...previewAssetHeaders,
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+  }).type(icon.type).send(icon.body);
 });
 const THREAD_MAX_DEPTH = 12;
 const THREAD_MAX_REPLIES = 300;

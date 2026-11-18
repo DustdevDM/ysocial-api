@@ -101,6 +101,12 @@ export const posts = pgTable(
     parentId: uuid("parent_id").references((): AnyPgColumn => posts.id, {
       onDelete: "cascade",
     }),
+    // A quote is a top-level post that embeds another post. The embedded post
+    // can later disappear (set null); isQuote tells that apart from "no quote".
+    quotedPostId: uuid("quoted_post_id").references((): AnyPgColumn => posts.id, {
+      onDelete: "set null",
+    }),
+    isQuote: boolean("is_quote").notNull().default(false),
     content: text().notNull(),
     gif: jsonb().$type<KlipyGif>(),
     poll: jsonb().$type<PollDefinition>(),
@@ -110,6 +116,11 @@ export const posts = pgTable(
     editedAt: timestamp("edited_at", { withTimezone: true, precision: 3 }),
   },
   (table) => [
+    index("posts_quoted_idx").on(table.quotedPostId).where(sql`${table.quotedPostId} IS NOT NULL`),
+    check(
+      "posts_quote_check",
+      sql`(${table.isQuote} OR ${table.quotedPostId} IS NULL) AND (NOT ${table.isQuote} OR ${table.parentId} IS NULL)`,
+    ),
     index("posts_parent_idx").on(
       table.parentId,
       table.createdAt.desc(),
@@ -201,6 +212,8 @@ export const postReposts = pgTable(
     userId: uuid("user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
+    // "friends" reposts are seen only by the reposter and their mutual follows.
+    audience: text().$type<"public" | "friends">().notNull().default("public"),
     createdAt: timestamp("created_at", { withTimezone: true, precision: 3 })
       .notNull()
       .defaultNow(),
@@ -211,6 +224,11 @@ export const postReposts = pgTable(
       table.userId,
       table.createdAt.desc(),
       table.postId.desc(),
+    ),
+    index("post_reposts_post_idx").on(table.postId, table.createdAt.desc()),
+    check(
+      "post_reposts_audience_check",
+      sql`${table.audience} IN ('public', 'friends')`,
     ),
   ],
 );
@@ -263,6 +281,7 @@ export const notificationKind = pgEnum("notification_kind", [
   "reply",
   "follow",
   "mention",
+  "quote",
 ]);
 export const notifications = pgTable(
   "notifications",

@@ -12,7 +12,8 @@ import {
 } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db/index.ts";
-import { posts, postReposts, users, userFollows } from "./db/schema.ts";
+import { posts, users, userFollows } from "./db/schema.ts";
+import { profileReposts } from "./feed-entries.ts";
 import { AuthError } from "./auth/provider.ts";
 import { postSelection, serializePost } from "./post-data.ts";
 import { userSelection } from "./user-data.ts";
@@ -130,14 +131,7 @@ router.get("/:handle", async (req, res) => {
     .where(and(eq(posts.authorId, profile.id), isNotNull(posts.parentId)))
     .orderBy(desc(posts.createdAt), desc(posts.id))
     .limit(20);
-  const reposts = await db
-    .select(postSelection(viewerId))
-    .from(postReposts)
-    .innerJoin(posts, eq(posts.id, postReposts.postId))
-    .innerJoin(users, eq(users.id, posts.authorId))
-    .where(eq(postReposts.userId, profile.id))
-    .orderBy(desc(postReposts.createdAt), desc(postReposts.postId))
-    .limit(20);
+  const { posts: reposts, repostedBy } = await profileReposts(profile, viewerId);
   const ancestry =
     replies.length === 0
       ? []
@@ -182,7 +176,9 @@ router.get("/:handle", async (req, res) => {
       (relationship) => relationship.followingId === viewerId,
     ),
     posts: recent.map(serializePost),
-    reposts: reposts.map(serializePost),
+    // Plain reposts and the person's own quote posts, newest first.
+    reposts,
+    repostedBy,
     replies: replies.map((post) => ({
       post: serializePost(post),
       thread: ancestry

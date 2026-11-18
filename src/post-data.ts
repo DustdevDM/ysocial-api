@@ -8,6 +8,7 @@ export const postFields = {
   parentId: posts.parentId,
   content: posts.content,
   gif: posts.gif,
+  voice: posts.voice,
   createdAt: posts.createdAt,
   editedAt: posts.editedAt,
 };

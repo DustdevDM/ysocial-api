@@ -1,16 +1,19 @@
 import type { BannerCrop } from "../storage/banner-crop.ts";
 import type { KlipyGif } from "../storage/klipy.ts";
 import type { PollDefinition } from "../poll-schema.ts";
+import type { Voice } from "../storage/voice-selection.ts";
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
   check,
+  customType,
   boolean,
   pgEnum,
   integer,
   jsonb,
   index,
   unique,
+  uniqueIndex,
   pgTable,
   primaryKey,
   text,
@@ -109,6 +112,7 @@ export const posts = pgTable(
     isQuote: boolean("is_quote").notNull().default(false),
     content: text().notNull(),
     gif: jsonb().$type<KlipyGif>(),
+    voice: jsonb().$type<Voice>(),
     poll: jsonb().$type<PollDefinition>(),
     createdAt: timestamp("created_at", { withTimezone: true, precision: 3 })
       .notNull()
@@ -129,7 +133,7 @@ export const posts = pgTable(
     index("posts_feed_idx").on(table.createdAt.desc(), table.id.desc()),
     check(
       "posts_content_check",
-      sql`char_length(${table.content}) <= 2000 AND (${table.content} ~ '[^[:space:]]' OR (${table.content} = '' AND (${table.gif} IS NOT NULL OR ${table.poll} IS NOT NULL)))`,
+      sql`char_length(${table.content}) <= 2000 AND (${table.content} ~ '[^[:space:]]' OR (${table.content} = '' AND (${table.gif} IS NOT NULL OR ${table.poll} IS NOT NULL OR ${table.voice} IS NOT NULL)))`,
     ),
   ],
 );
@@ -267,6 +271,30 @@ export const mediaDeletions = pgTable(
     attempts: integer().notNull().default(0),
   },
   (table) => [index("media_deletions_due_idx").on(table.availableAt)],
+);
+
+const bytea = customType<{ data: Buffer }>({ dataType: () => "bytea" });
+
+export const voiceJobs = pgTable(
+  "voice_jobs",
+  {
+    id: uuid().notNull(),
+    userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+    input: bytea(),
+    voice: jsonb().$type<Voice>(),
+    error: text(),
+    lease: uuid(),
+    attempts: integer().notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userId, table.id] }),
+    uniqueIndex("voice_jobs_user_pending_idx").on(table.userId).where(sql`${table.input} IS NOT NULL`),
+    index("voice_jobs_due_idx").on(table.nextAttemptAt).where(sql`${table.input} IS NOT NULL`),
+    index("voice_jobs_expiry_idx").on(table.expiresAt),
+    check("voice_jobs_one_state", sql`num_nonnulls(${table.input}, ${table.voice}, ${table.error}) = 1`),
+  ],
 );
 
 export const avatarHistory = pgTable(

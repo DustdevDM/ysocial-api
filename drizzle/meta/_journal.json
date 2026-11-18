@@ -176,6 +176,27 @@
       "when": 1795028932458,
       "tag": "0024_avatar_history",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1795028932459,
+      "tag": "0025_post_voice",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1795028932460,
+      "tag": "0026_voice_draft_expiry",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1795039681555,
+      "tag": "0027_voice_jobs",
+      "breakpoints": true
     }
   ]
 }

@@ -32,6 +32,12 @@ export async function readViewerId(req: Request): Promise<string | null> {
 
 export async function requireUser(req: Request) {
   requireOrigin(req);
+  return requireSessionUser(req);
+}
+
+// Safe reads authenticate the session without requiring the Origin header
+// that browsers omit on same-origin GET requests.
+export async function requireSessionUser(req: Request) {
   const session = await readSession(cookie(req, "session"));
   if (session.kind === "anonymous")
     throw new AuthError(401, "sign_in_required");

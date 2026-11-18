@@ -1,9 +1,9 @@
 import type { PoolClient } from "pg";
 import { sweepUnusedMedia } from "./media-sweep.ts";
 import { DeleteObjectCommand } from "@aws-sdk/client-s3";
-import { and, desc, eq, lte, or } from "drizzle-orm";
+import { and, desc, eq, lte, or, sql } from "drizzle-orm";
 import { createDatabase, db, pool } from "../db/index.ts";
-import { avatarHistory, mediaDeletions, users } from "../db/schema.ts";
+import { avatarHistory, mediaDeletions, posts, users } from "../db/schema.ts";
 import { AuthError } from "../auth/provider.ts";
 import type { BannerCrop } from "./banner-crop.ts";
 import { avatarStorage, putAvatar } from "./r2.ts";
@@ -14,10 +14,12 @@ export async function stageMediaUpload(
   key: string,
   body: Buffer,
   contentType = "image/avif",
+  lifetimeMs = 3600000,
 ) {
-  await db
+  const [pending] = await db
     .insert(mediaDeletions)
-    .values({ key, availableAt: new Date(Date.now() + 3600000) });
+    .values({ key, availableAt: sql`now() + ${lifetimeMs} * interval '1 millisecond'` })
+    .returning({ availableAt: mediaDeletions.availableAt });
   try {
     await putAvatar(key, body, contentType);
   } catch (error) {
@@ -28,6 +30,7 @@ export async function stageMediaUpload(
     await flushMediaDeletions(key);
     throw error;
   }
+  return pending.availableAt;
 }
 
 export const recentAvatarLimit = 5;
@@ -166,10 +169,6 @@ export async function removeRecentAvatar(userId: string, key: string) {
 export async function flushMediaDeletions(key?: string, database = db) {
   if (!avatarStorage) return;
   const { client, bucket } = avatarStorage;
-  // available_at defaults to the database's now() in microseconds, while Date
-  // truncates to milliseconds: a row queued in the same millisecond would
-  // otherwise look not yet due and be skipped.
-  const dueBy = new Date(Date.now() + 1);
   try {
     for (let processed = 0; processed < 25; processed++) {
       const found = await database.transaction(async (tx) => {
@@ -179,7 +178,7 @@ export async function flushMediaDeletions(key?: string, database = db) {
           .from(mediaDeletions)
           .where(
             and(
-              lte(mediaDeletions.availableAt, dueBy),
+              lte(mediaDeletions.availableAt, sql`now()`),
               key ? eq(mediaDeletions.key, key) : undefined,
             ),
           )
@@ -199,22 +198,32 @@ export async function flushMediaDeletions(key?: string, database = db) {
               .from(avatarHistory)
               .where(eq(avatarHistory.key, job.key))
               .limit(1);
-        if (!active && !kept) {
+        const [voicePost] = job.key.startsWith("voices/") ? await tx.select({ id: posts.id }).from(posts)
+          .where(eq(sql`${posts.voice}->>'key'`, job.key)).limit(1) : [];
+        if (!active && !kept && !voicePost) {
           try {
             // Deleting an already absent key succeeds, including after a crash.
             await client.send(
               new DeleteObjectCommand({ Bucket: bucket, Key: job.key }),
               { abortSignal: AbortSignal.timeout(5000) },
             );
-          } catch {
+          } catch (error) {
+            const voice = job.key.startsWith("voices/");
+            if (voice) console.warn({
+              event: "voice_deletion_retry",
+              key: job.key,
+              attempt: job.attempts + 1,
+              error: error instanceof Error ? error.name : undefined,
+            });
+            const delay = Math.min(
+              voice ? 30_000 : 3_600_000,
+              (voice ? 3000 : 30_000) * 2 ** Math.min(job.attempts, 7),
+            );
             await tx
               .update(mediaDeletions)
               .set({
                 attempts: job.attempts + 1,
-                availableAt: new Date(
-                  Date.now() +
-                    Math.min(3600000, 30000 * 2 ** Math.min(job.attempts, 7)),
-                ),
+                availableAt: sql`now() + ${delay} * interval '1 millisecond'`,
               })
               .where(eq(mediaDeletions.key, job.key));
             return true;
@@ -234,7 +243,6 @@ const MEDIA_SWEEP_LOCK = 7_001_001;
 
 export function startMediaCleanup() {
   if (!avatarStorage) return () => {};
-  void flushMediaDeletions();
   let sweeping = false;
   async function sweep() {
     if (sweeping) return;
@@ -261,13 +269,15 @@ export function startMediaCleanup() {
   const sweepTimer = setInterval(() => void sweep(), 6 * 60 * 60 * 1000);
   sweepTimer.unref();
   let running = false;
-  const timer = setInterval(() => {
+  function drain() {
     if (running) return;
     running = true;
     void flushMediaDeletions().finally(() => {
       running = false;
     });
-  }, 30000);
+  }
+  drain();
+  const timer = setInterval(drain, 3000);
   timer.unref();
   return () => {
     clearInterval(timer);

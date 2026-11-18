@@ -166,6 +166,13 @@ export function imgurImageUrl(url: URL) {
     return new URL(`https://i.imgur.com/${page}.png`);
 }
 
+function isImgurAlbum(url: URL) {
+  return (
+    (url.hostname === "imgur.com" || url.hostname === "www.imgur.com") &&
+    /^\/a\/[a-z0-9]+\/?$/i.test(url.pathname)
+  );
+}
+
 export async function previewsForPost(content: string, offset = 0) {
   const sources = websiteLinks(content);
   const end = offset + LINK_BATCH_SIZE;
@@ -174,6 +181,12 @@ export async function previewsForPost(content: string, offset = 0) {
       if (imgurImageUrl(url))
         return { kind: "image" as const, url, key: assetKey(url) };
       const metadata = await metadataFor(url);
+      if (
+        isImgurAlbum(url) &&
+        metadata?.image &&
+        imgurImageUrl(metadata.image)
+      )
+        return { kind: "image" as const, url, key: assetKey(url) };
       return metadata
         ? { kind: "website" as const, url, metadata, key: assetKey(url) }
         : null;

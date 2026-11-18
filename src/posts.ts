@@ -46,8 +46,10 @@ import { parseTopicName, syncPostTopics } from "./topics.ts";
 import { syncMentions } from "./mentions.ts";
 import { readGifSelection } from "./storage/klipy.ts";
 import { pollDefinitionSchema } from "./poll-schema.ts";
+import { previewIconForPost, previewImageForPost, previewsForPost } from "./link-previews.ts";
 
 const router = Router();
+
 const contentSchema = z.strictObject({
   content: z
     .string()
@@ -210,6 +212,40 @@ router.use((_req, res, next) => {
   res.set("Cache-Control", "no-store");
   next();
 });
+// For each reply in `page`, the posts above it, root first.
+async function loadAncestors(
+  page: { id: string; parentId: string | null }[],
+  viewerId: string | null,
+) {
+  const replyIds = page.filter((row) => row.parentId).map((row) => row.id);
+  const result = new Map<string, ReturnType<typeof serializePost>[]>();
+  if (!replyIds.length) return result;
+  const chains = await db.execute<{ origin: string; id: string }>(sql`
+    with recursive chain as (
+      select id as origin, parent_id as id, 1 as depth
+      from posts where id in (${sql.join(
+        replyIds.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )}) and parent_id is not null
+      union all
+      select c.origin, p.parent_id, c.depth + 1
+      from chain c join posts p on p.id = c.id
+      where p.parent_id is not null and c.depth < 100
+    )
+    select origin, id from chain order by origin, depth desc
+  `);
+  const ancestorRows = await db
+    .select(postSelection(viewerId))
+    .from(posts)
+    .innerJoin(users, eq(users.id, posts.authorId))
+    .where(inArray(posts.id, [...new Set(chains.rows.map((row) => row.id))]));
+  const byId = new Map(ancestorRows.map((row) => [row.id, serializePost(row)]));
+  for (const { origin, id } of chains.rows) {
+    const found = byId.get(id);
+    if (found) result.set(origin, [...(result.get(origin) ?? []), found]);
+  }
+  return result;
+}
 const listPosts: import("express").RequestHandler = async (req, res) => {
   const parentId =
     typeof req.params.id === "string" ? req.params.id : undefined;
@@ -267,9 +303,17 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
     .limit(21);
   const page = rows.slice(0, 20);
   const last = page.at(-1);
+  // A topic lists replies next to posts; send the chain above each reply so
+  // clients can show it in context instead of as a stray post.
+  const ancestors = topic ? await loadAncestors(page, viewerId) : undefined;
   res.json({
     posts: page.map(serializePost),
     repostedBy: {},
+    posts: page.map((row) =>
+      ancestors
+        ? { ...serializePost(row), ancestors: ancestors.get(row.id) ?? [] }
+        : serializePost(row),
+    ),
     nextCursor:
       rows.length > 20 && last
         ? Buffer.from(
@@ -320,6 +364,55 @@ router.get("/:id", async (req, res) => {
     post: await findPost(req.params.id, await readViewerId(req)),
     serverNow: new Date().toISOString(),
   });
+});
+async function postContent(id: string) {
+  const [post] = await db
+    .select({ content: posts.content })
+    .from(posts)
+    .where(eq(posts.id, id));
+  if (!post) throw new AuthError(404, "post_not_found");
+  return post.content;
+}
+router.get("/:id/link-previews", async (req, res) => {
+  const offset = req.query.offset ?? "0";
+  if (typeof offset !== "string" || !/^\d{1,4}$/.test(offset))
+    throw new AuthError(400, "invalid_cursor");
+  const content = await postContent(req.params.id);
+  res.json(await previewsForPost(content, Number(offset)));
+});
+const previewAssetHeaders = {
+  "Cache-Control": "public, max-age=3600",
+  "Cross-Origin-Resource-Policy": "same-origin",
+  "X-Content-Type-Options": "nosniff",
+};
+router.get("/:id/link-preview-image/:key", async (req, res) => {
+  if (!/^[0-9a-f]{64}$/.test(req.params.key)) {
+    res.sendStatus(404);
+    return;
+  }
+  const content = await postContent(req.params.id);
+  const image = await previewImageForPost(content, req.params.key);
+  if (!image) {
+    res.sendStatus(404);
+    return;
+  }
+  res.set(previewAssetHeaders).type("image/webp").send(image);
+});
+router.get("/:id/link-preview-icon/:key", async (req, res) => {
+  if (!/^[0-9a-f]{64}$/.test(req.params.key)) {
+    res.sendStatus(404);
+    return;
+  }
+  const icon = await previewIconForPost(await postContent(req.params.id), req.params.key);
+  if (!icon) {
+    res.sendStatus(404);
+    return;
+  }
+  // A directly opened SVG has an opaque origin and cannot execute or fetch resources.
+  res.set({
+    ...previewAssetHeaders,
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+  }).type(icon.type).send(icon.body);
 });
 const THREAD_MAX_DEPTH = 12;
 const THREAD_MAX_REPLIES = 300;

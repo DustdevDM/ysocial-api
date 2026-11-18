@@ -118,6 +118,28 @@ test("post and reply flows", async (t) => {
       await count(unrelated.id, 1);
     });
 
+    await t.test("posting, replying, and editing allow more than five links", async () => {
+      const content = Array.from({ length: 8 }, (_, index) => `https://example.org/${index}`).join(" ");
+      const clientId = randomUUID();
+
+      const created = await request("/api/posts", "POST", { content, clientId });
+      assert.equal(created.status, 201);
+      const { post } = await created.json();
+      assert.equal(post.id, clientId);
+      assert.equal(post.content, content);
+      const postPath = `/api/posts/${post.id}`;
+
+      const replay = await request("/api/posts", "POST", { content, clientId });
+      assert.equal(replay.status, 201);
+      assert.equal((await replay.json()).post.id, clientId);
+      const reply = await request(`${postPath}/replies`, "POST", { content });
+      assert.equal(reply.status, 201);
+      assert.equal((await reply.json()).post.content, content);
+      const edit = await request(postPath, "PATCH", { content: `Edited: ${content}` });
+      assert.equal(edit.status, 200);
+      assert.equal((await get(postPath)).post.content, `Edited: ${content}`);
+    });
+
     await t.test("KLIPY GIFs survive publishing, retries, and caption edits", async () => {
       const url = "https://static.klipy.com/test/wave.gif";
       const title = "Waving hello";

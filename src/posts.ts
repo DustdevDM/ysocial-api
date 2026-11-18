@@ -163,6 +163,40 @@ router.use((_req, res, next) => {
   res.set("Cache-Control", "no-store");
   next();
 });
+// For each reply in `page`, the posts above it, root first.
+async function loadAncestors(
+  page: { id: string; parentId: string | null }[],
+  viewerId: string | null,
+) {
+  const replyIds = page.filter((row) => row.parentId).map((row) => row.id);
+  const result = new Map<string, ReturnType<typeof serializePost>[]>();
+  if (!replyIds.length) return result;
+  const chains = await db.execute<{ origin: string; id: string }>(sql`
+    with recursive chain as (
+      select id as origin, parent_id as id, 1 as depth
+      from posts where id in (${sql.join(
+        replyIds.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )}) and parent_id is not null
+      union all
+      select c.origin, p.parent_id, c.depth + 1
+      from chain c join posts p on p.id = c.id
+      where p.parent_id is not null and c.depth < 100
+    )
+    select origin, id from chain order by origin, depth desc
+  `);
+  const ancestorRows = await db
+    .select(postSelection(viewerId))
+    .from(posts)
+    .innerJoin(users, eq(users.id, posts.authorId))
+    .where(inArray(posts.id, [...new Set(chains.rows.map((row) => row.id))]));
+  const byId = new Map(ancestorRows.map((row) => [row.id, serializePost(row)]));
+  for (const { origin, id } of chains.rows) {
+    const found = byId.get(id);
+    if (found) result.set(origin, [...(result.get(origin) ?? []), found]);
+  }
+  return result;
+}
 const listPosts: import("express").RequestHandler = async (req, res) => {
   const parentId =
     typeof req.params.id === "string" ? req.params.id : undefined;
@@ -216,8 +250,15 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
     .limit(21);
   const page = rows.slice(0, 20);
   const last = page.at(-1);
+  // A topic lists replies next to posts; send the chain above each reply so
+  // clients can show it in context instead of as a stray post.
+  const ancestors = topic ? await loadAncestors(page, viewerId) : undefined;
   res.json({
-    posts: page.map(serializePost),
+    posts: page.map((row) =>
+      ancestors
+        ? { ...serializePost(row), ancestors: ancestors.get(row.id) ?? [] }
+        : serializePost(row),
+    ),
     nextCursor:
       rows.length > 20 && last
         ? Buffer.from(

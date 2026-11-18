@@ -183,6 +183,20 @@ test("topics: tagging, feeds, trending and suggestions", async () => {
     assert.equal((await get("/api/posts?topic=Launch")).posts.length, 4);
     assert.equal((await get("/api/posts?topic=unused")).posts.length, 0);
     assert.ok(feed.posts.every((post) => post.topics.includes("launch")));
+
+    // Replies come with the thread above them, root first; posts have none.
+    assert.deepEqual(feed.posts.find((post) => post.id === reply.id).ancestors.map((post) => post.id), [first.id]);
+    assert.ok(feed.posts.filter((post) => post.id !== reply.id).every((post) => post.ancestors.length === 0));
+    const middle = await create("no tags here", reply.id);
+    const deep = await create("deep #threaded", middle.id);
+    const threaded = (await get("/api/posts?topic=threaded")).posts;
+    assert.deepEqual(threaded.map((post) => post.id), [deep.id]);
+    assert.deepEqual(threaded[0].ancestors.map((post) => post.id), [first.id, reply.id, middle.id]);
+    assert.equal(threaded[0].ancestors[0].author.handle, "topic_author");
+    // The home feed and reply lists keep their shape.
+    assert.ok((await get("/api/posts")).posts.every((post) => !("ancestors" in post)));
+    assert.equal((await request(`/api/posts/${deep.id}`, "DELETE")).status, 204);
+    assert.equal((await request(`/api/posts/${middle.id}`, "DELETE")).status, 204);
     for (let index = 0; index < 22; index++) await create("paged #paging");
     const page = await get("/api/posts?topic=paging");
     assert.equal(page.posts.length, 20);

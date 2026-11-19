@@ -3,6 +3,7 @@ import { db } from "./db/index.ts";
 import { posts, users } from "./db/schema.ts";
 import { postSelection, repostVisibleSql, serializePost } from "./post-data.ts";
 import { userSelection } from "./user-data.ts";
+import { attachSelfReplies } from "./self-replies.ts";
 
 type FeedUser = { id: string; handle: string; displayName: string; avatarUrl: string | null };
 type Audience = "public" | "friends";
@@ -96,7 +97,7 @@ export async function homeFeed(
   }
   const last = page.at(-1);
   return {
-    posts: list,
+    posts: await attachSelfReplies(list, viewerId),
     repostedBy,
     nextCursor:
       rows.length > limit && last

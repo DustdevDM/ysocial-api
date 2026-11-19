@@ -77,6 +77,54 @@ router.get("/:handle/availability", async (req, res) => {
   const available = !existing || existing.id === (await readViewerId(req));
   res.json({ available });
 });
+router.get("/:handle/card", async (req, res) => {
+  const handle = handleSchema.safeParse(req.params.handle.toLowerCase());
+  if (!handle.success) throw new AuthError(404, "profile_not_found");
+  const [profile] = await db
+    .select({
+      ...userSelection,
+      bio: users.bio,
+      bannerCrop: users.bannerCrop,
+      bannerUrl: sql<
+        string | null
+      >`case when ${users.bannerKey} is null then ${users.bannerExternalUrl} else '/api/' || ${users.bannerKey} end`,
+      createdAt: users.createdAt,
+      followerCount: sql<number>`(select count(*)::int from ${userFollows} where ${userFollows.followingId} = ${users.id})`,
+      followingCount: sql<number>`(select count(*)::int from ${userFollows} where ${userFollows.followerId} = ${users.id})`,
+      postCount: sql<number>`(select count(*)::int from ${posts} where ${posts.authorId} = ${users.id} and ${posts.parentId} is null)`,
+    })
+    .from(users)
+    .where(eq(users.handle, handle.data));
+  if (!profile) throw new AuthError(404, "profile_not_found");
+  const viewerId = await readViewerId(req);
+  const relationships = viewerId
+    ? await db
+        .select({
+          followerId: userFollows.followerId,
+          followingId: userFollows.followingId,
+        })
+        .from(userFollows)
+        .where(
+          or(
+            and(
+              eq(userFollows.followerId, viewerId),
+              eq(userFollows.followingId, profile.id),
+            ),
+            and(
+              eq(userFollows.followerId, profile.id),
+              eq(userFollows.followingId, viewerId),
+            ),
+          ),
+        )
+    : [];
+  res.json({
+    profile,
+    isFollowing: relationships.some((row) => row.followerId === viewerId),
+    isFollowedBy: relationships.some((row) => row.followingId === viewerId),
+    isSelf: viewerId === profile.id,
+    signedIn: viewerId !== null,
+  });
+});
 router.get("/:handle", async (req, res) => {
   if (!handleSchema.safeParse(req.params.handle).success) {
     throw new AuthError(404, "profile_not_found");

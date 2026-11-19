@@ -56,6 +56,7 @@ export type QuotedPost = {
   parentId: string | null;
   pollTitle: string | null;
   isQuote: boolean;
+  mentions: { id: string; handle: string; username: string }[];
   author: { id: string; handle: string; displayName: string; avatarUrl: string | null };
 };
 export type PostQuote = { state: "available"; post: QuotedPost } | { state: "unavailable" };
@@ -69,6 +70,8 @@ export const quoteSelection = {
         'id', q.id, 'content', q.content, 'gif', q.gif,
         'createdAt', q.created_at, 'editedAt', q.edited_at, 'parentId', q.parent_id,
         'pollTitle', q.poll->>'title', 'isQuote', q.is_quote,
+        'mentions', (select coalesce(jsonb_agg(jsonb_build_object('id', mu.id, 'handle', mu.handle, 'username', qm.handle)), '[]'::jsonb)
+          from post_mentions qm join users mu on mu.id = qm.user_id where qm.post_id = q.id),
         'author', jsonb_build_object('id', u.id, 'handle', u.handle, 'displayName', u.display_name,
           'avatarUrl', coalesce('/api/' || u.avatar_key, (select ai.picture from auth_identities ai where ai.user_id = u.id and ai.deleted_at is null)))
       ))

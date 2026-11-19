@@ -50,7 +50,7 @@ test("mentions resolve, notify, edit, and deduplicate through the API", async ()
     const base = `http://127.0.0.1:${server.address().port}`;
     const availability = await fetch(base + "/api/profiles/whz/availability");
     assert.equal(availability.status, 200);
-    assert.deepEqual(await availability.json(), { available: false });
+    assert.deepEqual(await availability.json(), { available: true });
     async function request(path, method = "GET", body) {
       return fetch(base + path, {
         method,

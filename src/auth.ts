@@ -12,7 +12,7 @@ import {
   oauthTransactions,
   users,
 } from "./db/schema.ts";
-import { adminHandle, env, reservedAdminHandle } from "./config.ts";
+import { env } from "./config.ts";
 import { AuthError, exchange, providerPost } from "./auth/provider.ts";
 import { decrypt, encrypt, hash, random } from "./auth/secrets.ts";
 import { readSession } from "./auth/session.ts";
@@ -126,11 +126,6 @@ router.get("/callback", async (req, res) => {
           },
         })
         .returning();
-      if (identity.userId && identity.username.toLowerCase() === adminHandle) {
-        await tx.update(users)
-          .set({ role: "admin" })
-          .where(and(eq(users.id, identity.userId), eq(users.handle, adminHandle)));
-      }
       await tx.insert(authSessions).values({
         tokenHash: hash(token),
         identityId: identity.id,
@@ -208,14 +203,10 @@ router.post("/profile", async (req, res) => {
     if (!identity || identity.deletedAt || identity.sessionVersion !== active.sessionVersion)
       throw new AuthError(401, "sign_in_required");
     if (identity.userId) throw new AuthError(409, "already_onboarded");
-    const verifiedAdmin = input.data.handle === adminHandle && identity.username.toLowerCase() === adminHandle;
-    if (input.data.handle === reservedAdminHandle && !verifiedAdmin)
-      throw new AuthError(409, "handle_unavailable");
     const [created] = await tx
       .insert(users)
       .values({
         handle: input.data.handle,
-        role: verifiedAdmin ? "admin" : "user",
         displayName: identity.displayName.slice(0, 80),
       })
       .returning();

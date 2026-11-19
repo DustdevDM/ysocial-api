@@ -109,17 +109,17 @@ test("staff sessions can read admin data and role changes take effect on the nex
     await database.pool.query("DELETE FROM users WHERE id = $1", [regularUser.id]);
 
     const newToken = await onboardingSession("ytest");
-    const newAdmin = await onboard(newToken);
-    assert.equal(newAdmin.status, 201);
-    const { user: bootstrapAdmin } = await newAdmin.json();
+    const joinedYtest = await onboard(newToken);
+    assert.equal(joinedYtest.status, 201);
+    const { user: ytest } = await joinedYtest.json();
     const staffHeaders = { Cookie: `session=${newToken}` };
     assert.equal((await fetch(base + "/api/admin/session", {
       headers: staffHeaders,
     })).status, 403);
-    await database.pool.query("UPDATE users SET approved_at = now() WHERE id = $1", [bootstrapAdmin.id]);
-    assert.equal((await fetch(base + "/api/admin/session", {
-      headers: staffHeaders,
-    })).status, 204);
+    const ytestSession = await fetch(base + "/auth/me", { headers: staffHeaders }).then(response => response.json());
+    assert.equal(ytestSession.pendingApproval, true);
+    assert.equal(ytestSession.user.role, "user");
+    await database.pool.query("UPDATE users SET role = 'admin', approved_at = now() WHERE id = $1", [ytest.id]);
 
     const applicantToken = await onboardingSession("waitlist_test");
     const joined = await onboard(applicantToken, "waitlist_test");
@@ -404,11 +404,12 @@ test("staff sessions can read admin data and role changes take effect on the nex
       if (String(input) === tokenEndpoint) {
         const body = JSON.parse(options.body);
         redirectUris.push(body.redirect_uri);
-        if (body.code === "moderation-login") {
-          const idToken = await new SignJWT({ nonce: loginNonce, preferred_username: "waitlist_test" })
+        if (body.code === "moderation-login" || body.code === "ytest-login") {
+          const username = body.code === "ytest-login" ? "ytest" : "waitlist_test";
+          const idToken = await new SignJWT({ nonce: loginNonce, preferred_username: username })
             .setProtectedHeader({ alg: "RS256" })
             .setIssuer("https://test.invalid").setAudience(env.CNS_CLIENT_ID)
-            .setSubject("waitlist_test").setIssuedAt().setExpirationTime("5m").sign(privateKey);
+            .setSubject(username).setIssuedAt().setExpirationTime("5m").sign(privateKey);
           return Response.json({
             access_token: "test-access", refresh_token: "test-refresh", token_type: "Bearer",
             expires_in: 3600, id_token: idToken,
@@ -437,6 +438,20 @@ test("staff sessions can read admin data and role changes take effect on the nex
       assert.equal(replay.headers.get("location"), "/login?error=invalid_login_state");
     }
     assert.deepEqual(redirectUris, [env.ADMIN_ORIGIN + "/auth/callback", env.APP_ORIGIN + "/auth/callback"]);
+
+    await database.pool.query("UPDATE users SET role = 'user', approved_at = NULL WHERE id = $1", [ytest.id]);
+    const adminLogin = await fetch(base + "/auth/admin/login", { redirect: "manual" });
+    const adminLoginParams = new URL(adminLogin.headers.get("location")).searchParams;
+    loginNonce = adminLoginParams.get("nonce");
+    const adminCallback = await fetch(base + `/auth/callback?state=${adminLoginParams.get("state")}&code=ytest-login`, {
+      headers: { Cookie: adminLogin.headers.get("set-cookie").split(";")[0] }, redirect: "manual",
+    });
+    assert.equal(adminCallback.headers.get("location"), "/");
+    const signedInHeaders = { Cookie: adminCallback.headers.getSetCookie().find(cookie => cookie.startsWith("session=")).split(";")[0] };
+    const signedInYtest = await fetch(base + "/auth/me", { headers: signedInHeaders }).then(response => response.json());
+    assert.equal(signedInYtest.pendingApproval, true);
+    assert.equal(signedInYtest.user.role, "user");
+    await database.pool.query("UPDATE users SET role = 'admin', approved_at = now() WHERE id = $1", [ytest.id]);
 
     async function signInApplicant() {
       const login = await fetch(base + "/auth/login", { redirect: "manual" });

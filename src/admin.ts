@@ -12,7 +12,7 @@ import { serveLiveStream } from "./live.ts";
 import { removePost } from "./post-removal.ts";
 import { publishUserPostVisibility, removeUser } from "./user-removal.ts";
 
-import { env, reservedAdminHandle } from "./config.ts";
+import { env } from "./config.ts";
 import type { Request } from "express";
 
 const router = Router();
@@ -42,8 +42,8 @@ const userFields = {
   bannedAt: users.bannedAt,
   banReason: users.banReason,
 };
-const canModerateAccount = (viewer: { id: string; role: string }, target: { id: string; handle: string }) =>
-  viewer.role === "admin" && viewer.id !== target.id && target.handle !== reservedAdminHandle;
+const canModerateAccount = (viewer: { id: string; role: string }, target: { id: string }) =>
+  viewer.role === "admin" && viewer.id !== target.id;
 const postFields = {
   id: posts.id,
   authorId: users.id,
@@ -403,8 +403,6 @@ router.patch("/users/:id/profile", async (req, res) => {
     if (change.action === "clearAvatar" || change.action === "clearBanner") {
       await clearProfileMedia(tx, target, change.action === "clearAvatar" ? "avatar" : "banner");
     } else {
-      if (change.action === "changeUsername" && (target.handle === reservedAdminHandle || change.value === reservedAdminHandle))
-        throw new AuthError(409, "reserved_username");
       const fields = change.action === "changeUsername" ? { handle: change.value }
         : change.action === "changeName" ? { displayName: change.value }
         : { bio: change.action === "changeBio" ? change.value : "" };
@@ -421,8 +419,8 @@ router.patch("/users/:id/profile", async (req, res) => {
   });
   res.json({
     ...updated,
-    canEditRole: viewer.id !== updated.id && updated.handle.slice(1) !== reservedAdminHandle,
-    canModerateAccount: viewer.id !== updated.id && updated.handle.slice(1) !== reservedAdminHandle,
+    canEditRole: canModerateAccount(viewer, updated),
+    canModerateAccount: canModerateAccount(viewer, updated),
   });
 });
 
@@ -482,8 +480,6 @@ router.patch("/users/roles", async (req, res) => {
     if (actor?.role !== "admin" || actor.bannedAt) throw new AuthError(403, "admin_required");
     const targets = locked.filter((user) => user.id !== viewer.id);
     if (targets.length !== ids.length) throw new AuthError(404, "user_not_found");
-    if (targets.some((user) => user.handle === reservedAdminHandle))
-      throw new AuthError(409, "reserved_role_protected");
     const changed = targets.filter((user) => user.role !== input.data.role);
     if (changed.length) await tx.insert(moderationActivity).values(changed.map((user) => ({
       actorId: actor.id, actorHandle: actor.handle, targetId: user.id, targetHandle: user.handle,

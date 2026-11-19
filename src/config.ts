@@ -80,5 +80,3 @@ if (
   throw new Error("Production CNS endpoints must use HTTPS");
 }
 
-export const adminHandle = env.NODE_ENV === "development" ? "ytest" : "whz";
-export const reservedAdminHandle = adminHandle.includes("test") ? null : adminHandle;

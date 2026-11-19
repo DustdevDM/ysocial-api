@@ -17,7 +17,6 @@ import { profileReposts } from "./feed-entries.ts";
 import { AuthError } from "./auth/provider.ts";
 import { postSelection, serializePost } from "./post-data.ts";
 import { banDetailsSelection, publicProfileSelection, userSelection } from "./user-data.ts";
-import { reservedAdminHandle } from "./config.ts";
 import { recordNotification } from "./notification-events.ts";
 
 const router = Router();
@@ -55,9 +54,6 @@ router.patch("/me", async (req, res) => {
     .refine((changes) => Object.keys(changes).length > 0)
     .safeParse(req.body);
   if (!input.success) throw new AuthError(400, "invalid_profile");
-  if (input.data.handle && input.data.handle !== viewer.handle &&
-    (input.data.handle === reservedAdminHandle || viewer.handle === reservedAdminHandle))
-    throw new AuthError(409, "reserved_username");
   const [profile] = await db
     .update(users)
     .set({ ...input.data, updatedAt: new Date() })
@@ -78,9 +74,7 @@ router.get("/:handle/availability", async (req, res) => {
     .from(userHandles)
     .where(eq(userHandles.handle, handle.data))
     .limit(1);
-  const available = existing
-    ? existing.id === (await readViewerId(req))
-    : handle.data !== reservedAdminHandle;
+  const available = !existing || existing.id === (await readViewerId(req));
   res.json({ available });
 });
 router.get("/:handle", async (req, res) => {

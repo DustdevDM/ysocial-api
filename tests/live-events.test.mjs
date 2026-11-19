@@ -72,7 +72,7 @@ test("live post stream", async (t) => {
     const { hash } = await import("../src/auth/secrets.ts");
     const { startLiveEvents, publishLivePost } = await import("../src/live-events.ts");
     const { rows: [user] } = await pool.query(
-      "INSERT INTO users (handle) VALUES ('live_author') RETURNING id",
+      "INSERT INTO users (handle, approved_at) VALUES ('live_author', now()) RETURNING id",
     );
     const { rows: [identity] } = await pool.query(
       "INSERT INTO auth_identities (issuer, subject, user_id) VALUES ('https://test.invalid', 'live-author', $1) RETURNING id",

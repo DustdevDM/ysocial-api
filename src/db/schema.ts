@@ -21,15 +21,34 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 
+export const userRole = pgEnum("user_role", ["admin", "moderator", "og", "user"]);
+
+export const moderationActivity = pgTable("moderation_activity", {
+  id: uuid().defaultRandom().primaryKey(),
+  actorId: uuid("actor_id").notNull(),
+  actorHandle: text("actor_handle").notNull(),
+  targetId: uuid("target_id").notNull(),
+  targetHandle: text("target_handle").notNull(),
+  action: text().notNull(),
+  detail: text(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [index("moderation_activity_created_idx").on(table.createdAt.desc(), table.id.desc())]);
+
 export const users = pgTable(
   "users",
   {
     id: uuid().defaultRandom().primaryKey(),
+    role: userRole().notNull().default("user"),
+    approvedAt: timestamp("approved_at", { withTimezone: true, precision: 3 }),
+    bannedAt: timestamp("banned_at", { withTimezone: true, precision: 3 }),
+    banReason: text("ban_reason"),
+    sessionVersion: integer("session_version").notNull().default(0),
     handle: text().notNull().unique("users_handle_unique"),
     displayName: text("display_name").notNull().default(""),
     bio: text().notNull().default(""),
     notificationPromptDismissed: boolean("notification_prompt_dismissed").notNull().default(false),
     avatarKey: text("avatar_key"),
+    identityAvatarHidden: boolean("identity_avatar_hidden").notNull().default(false),
     bannerKey: text("banner_key"),
     bannerCrop: jsonb("banner_crop").$type<BannerCrop>(),
     bannerExternalUrl: text("banner_external_url"),
@@ -42,6 +61,7 @@ export const users = pgTable(
       .defaultNow(),
   },
   (table) => [
+    index("users_waitlist_idx").on(table.createdAt, table.id).where(sql`${table.approvedAt} is null`),
     check("users_handle_check", sql`${table.handle} ~ '^[a-z0-9_]{3,32}$'`),
     check(
       "users_display_name_check",
@@ -52,9 +72,19 @@ export const users = pgTable(
   ],
 );
 
+export const userHandles = pgTable(
+  "user_handles",
+  {
+    handle: text().primaryKey(),
+    userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  },
+  (table) => [index("user_handles_user_idx").on(table.userId)],
+);
+
 export const oauthTransactions = pgTable("oauth_transactions", {
   state: text().primaryKey(),
   browserHash: text("browser_hash").notNull(),
+  admin: boolean().notNull().default(false),
   verifier: text().notNull(),
   nonce: text().notNull(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
@@ -76,6 +106,7 @@ export const authIdentities = pgTable(
       .notNull()
       .defaultNow(),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    sessionVersion: integer("session_version").notNull().default(0),
   },
   (table) => [
     unique("auth_identity_subject_unique").on(table.issuer, table.subject),
@@ -88,6 +119,7 @@ export const authSessions = pgTable("auth_sessions", {
     .notNull()
     .references(() => authIdentities.id, { onDelete: "cascade" }),
   encryptedTokens: text("encrypted_tokens").notNull(),
+  sessionVersion: integer("session_version").notNull().default(0),
   refreshAfter: timestamp("refresh_after", { withTimezone: true }).notNull(),
   retryAfter: timestamp("retry_after", { withTimezone: true }),
   refreshFailures: integer("refresh_failures").notNull().default(0),
@@ -118,6 +150,7 @@ export const posts = pgTable(
       .notNull()
       .defaultNow(),
     editedAt: timestamp("edited_at", { withTimezone: true, precision: 3 }),
+    flaggedAt: timestamp("flagged_at", { withTimezone: true, precision: 3 }),
   },
   (table) => [
     index("posts_quoted_idx").on(table.quotedPostId).where(sql`${table.quotedPostId} IS NOT NULL`),

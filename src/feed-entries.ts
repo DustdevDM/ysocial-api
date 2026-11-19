@@ -1,4 +1,4 @@
-import { eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db } from "./db/index.ts";
 import { posts, users } from "./db/schema.ts";
 import { postSelection, repostVisibleSql, serializePost } from "./post-data.ts";
@@ -24,7 +24,7 @@ function selectPosts(ids: string[], viewerId: string | null) {
     .select(postSelection(viewerId))
     .from(posts)
     .innerJoin(users, eq(users.id, posts.authorId))
-    .where(inArray(posts.id, ids));
+    .where(and(inArray(posts.id, ids), isNull(users.bannedAt)));
 }
 async function loadPosts(ids: string[], viewerId: string | null) {
   if (!ids.length) return new Map<string, PostRecord>();
@@ -63,10 +63,11 @@ export async function homeFeed(
     select p.id as post_id, ${activity} as at, ${epochMs(activity)} as at_ms, lr.user_id as reposter_id,
       lr.audience as audience, lr.n::int as others
     from posts p
+    join users author on author.id = p.author_id and author.banned_at is null
     left join lateral (
       select r.user_id, r.created_at, r.audience, count(*) over () - 1 as n
-      from post_reposts r
-      where r.post_id = p.id and ${repostVisibleSql(viewerId)}
+      from post_reposts r join users reposter on reposter.id = r.user_id
+      where r.post_id = p.id and reposter.banned_at is null and ${repostVisibleSql(viewerId)}
       order by r.created_at desc, r.user_id desc
       limit 1
     ) lr on true

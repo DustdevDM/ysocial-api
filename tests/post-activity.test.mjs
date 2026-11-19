@@ -32,9 +32,9 @@ test("post activity lists all participants, validates queries, and reflects remo
       migrationsFolder: fileURLToPath(new URL("../drizzle", import.meta.url)),
     });
     const { rows: people } = await pool.query(
-      `INSERT INTO users (handle, display_name, avatar_key)
+      `INSERT INTO users (handle, display_name, avatar_key, approved_at)
        SELECT 'person_' || n, 'Person ' || n,
-         CASE WHEN n = 1 THEN 'avatars/test.webp' ELSE NULL END
+         CASE WHEN n = 1 THEN 'avatars/test.webp' ELSE NULL END, now()
        FROM generate_series(1, 56) n RETURNING id, handle, display_name`,
     );
     const {

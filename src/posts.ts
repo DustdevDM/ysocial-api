@@ -7,6 +7,7 @@ import {
   pollSelection,
   mutualFollowSql,
   repostVisibleSql,
+  visiblePostAuthor,
 } from "./post-data.ts";
 import { homeFeed } from "./feed-entries.ts";
 import { Router, type Request } from "express";
@@ -45,6 +46,7 @@ import { recordNotification } from "./notification-events.ts";
 import { parseTopicName, syncPostTopics } from "./topics.ts";
 import { extractTopics } from "./topics-text.ts";
 import { affectedPostIds, publishLiveChange, publishLivePost } from "./live-events.ts";
+import { removePost } from "./post-removal.ts";
 
 import { syncMentions } from "./mentions.ts";
 import { attachSelfReplies } from "./self-replies.ts";
@@ -88,7 +90,7 @@ async function findPost(id: string, viewerId: string | null = null) {
     .select(postSelection(viewerId))
     .from(posts)
     .innerJoin(users, eq(users.id, posts.authorId))
-    .where(eq(posts.id, id));
+    .where(and(eq(posts.id, id), isNull(users.bannedAt)));
   if (!post) throw new AuthError(404, "post_not_found");
   return serializePost(post);
 }
@@ -116,7 +118,7 @@ async function createPost({
       const [parent] = await tx
         .select({ id: posts.id, authorId: posts.authorId })
         .from(posts)
-        .where(eq(posts.id, parentId))
+        .where(and(eq(posts.id, parentId), visiblePostAuthor))
         .for("key share");
       if (!parent) throw new AuthError(404, "post_not_found");
       parentAuthor = parent.authorId;
@@ -128,7 +130,7 @@ async function createPost({
       const [quoted] = await tx
         .select({ id: posts.id, authorId: posts.authorId })
         .from(posts)
-        .where(eq(posts.id, quotedPostId))
+        .where(and(eq(posts.id, quotedPostId), visiblePostAuthor))
         .for("key share");
       if (quoted) quotedAuthor = quoted.authorId;
       else quotedGone = true;
@@ -262,7 +264,7 @@ async function loadAncestors(
     .select(postSelection(viewerId))
     .from(posts)
     .innerJoin(users, eq(users.id, posts.authorId))
-    .where(inArray(posts.id, [...new Set(chains.rows.map((row) => row.id))]));
+    .where(and(isNull(users.bannedAt), inArray(posts.id, [...new Set(chains.rows.map((row) => row.id))])));
   const byId = new Map(ancestorRows.map((row) => [row.id, serializePost(row)]));
   for (const { origin, id } of chains.rows) {
     const found = byId.get(id);
@@ -302,6 +304,7 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
     .innerJoin(users, eq(users.id, posts.authorId))
     .where(
       and(
+        isNull(users.bannedAt),
         parentId ? eq(posts.parentId, parentId) : undefined,
         topic
           ? inArray(
@@ -364,7 +367,7 @@ router.get("/poll-results", async (req, res) => {
   const results = await db
     .select({ id: posts.id, poll: pollSelection(viewerId) })
     .from(posts)
-    .where(and(inArray(posts.id, parsed.data.ids), sql`${posts.poll} is not null`));
+    .where(and(inArray(posts.id, parsed.data.ids), visiblePostAuthor, sql`${posts.poll} is not null`));
   res.json({ viewerId, results });
 });
 router.get("/states", async (req, res) => {
@@ -375,11 +378,15 @@ router.get("/states", async (req, res) => {
   if (!parsed.success) throw new AuthError(400, "invalid_post_id");
   const viewerId = await readViewerId(req);
   const rows = await db
-    .select(postSelection(viewerId))
+    .select({ ...postSelection(viewerId), bannedAt: users.bannedAt })
     .from(posts)
     .innerJoin(users, eq(users.id, posts.authorId))
     .where(inArray(posts.id, parsed.data.ids));
-  res.json({ viewerId, posts: rows.map((row) => serializePost(row)) });
+  res.json({
+    viewerId,
+    posts: rows.flatMap(({ bannedAt, ...row }) => bannedAt ? [] : [serializePost(row)]),
+    hiddenIds: rows.filter((row) => row.bannedAt).map((row) => row.id),
+  });
 });
 router.post("/", async (req, res) => {
   const user = await requireUser(req);
@@ -409,7 +416,7 @@ async function postContent(id: string) {
   const [post] = await db
     .select({ content: posts.content })
     .from(posts)
-    .where(eq(posts.id, id));
+    .where(and(eq(posts.id, id), visiblePostAuthor));
   if (!post) throw new AuthError(404, "post_not_found");
   return post.content;
 }
@@ -483,6 +490,7 @@ router.get("/:id/thread", async (req, res) => {
         where t.depth < ${THREAD_MAX_DEPTH}
       )
       select t.id from tree t join posts p on p.id = t.id
+      join users u on u.id = p.author_id and u.banned_at is null
       order by t.depth, p.created_at, p.id
       limit ${THREAD_MAX_REPLIES + 1}
     `),
@@ -498,7 +506,7 @@ router.get("/:id/thread", async (req, res) => {
         .select(postSelection(viewerId))
         .from(posts)
         .innerJoin(users, eq(users.id, posts.authorId))
-        .where(inArray(posts.id, wanted))
+        .where(and(inArray(posts.id, wanted), isNull(users.bannedAt)))
     : [];
   const byId = new Map(rows.map((row) => [row.id, serializePost(row)]));
   const pick = (ids: string[]) =>
@@ -541,7 +549,7 @@ router.put("/:id/poll/vote", async (req, res) => {
     const [post] = await tx
       .select({ poll: posts.poll })
       .from(posts)
-      .where(eq(posts.id, postId))
+      .where(and(eq(posts.id, postId), visiblePostAuthor))
       .for("update");
     if (!post?.poll) throw new AuthError(404, "poll_not_found");
     if (optionIndex >= post.poll.options.length)
@@ -577,7 +585,7 @@ router.get("/:id/poll/voters", async (req, res) => {
   const [post] = await db
     .select({ poll: posts.poll })
     .from(posts)
-    .where(eq(posts.id, req.params.id));
+    .where(and(eq(posts.id, req.params.id), visiblePostAuthor));
   if (!post?.poll) throw new AuthError(404, "poll_not_found");
   if (post.poll.anonymous) throw new AuthError(403, "poll_is_anonymous");
   const { options } = post.poll;
@@ -620,7 +628,7 @@ router.get("/:id/activity", async (req, res) => {
           .select({ ...userSelection, quoteId: posts.id })
           .from(posts)
           .innerJoin(users, eq(users.id, posts.authorId))
-          .where(and(eq(posts.quotedPostId, req.params.id), cursor ? gt(posts.id, cursor) : undefined))
+          .where(and(eq(posts.quotedPostId, req.params.id), isNull(users.bannedAt), cursor ? gt(posts.id, cursor) : undefined))
           .orderBy(asc(posts.id))
           .limit(51)
       : type === "likes"
@@ -679,7 +687,7 @@ async function setLike(req: Request, liked: boolean) {
     const [post] = await tx
       .select({ id: posts.id, authorId: posts.authorId })
       .from(posts)
-      .where(eq(posts.id, id))
+      .where(and(eq(posts.id, id), visiblePostAuthor))
       .for("update");
     if (!post) throw new AuthError(404, "post_not_found");
     if (liked) {
@@ -730,7 +738,7 @@ async function setRepost(req: Request, reposted: boolean) {
     const [post] = await tx
       .select({ id: posts.id, authorId: posts.authorId, parentId: posts.parentId })
       .from(posts)
-      .where(eq(posts.id, id))
+      .where(and(eq(posts.id, id), visiblePostAuthor))
       .for("update");
     if (!post) throw new AuthError(404, "post_not_found");
     if (reposted) {
@@ -849,15 +857,7 @@ router.patch("/:id", async (req, res) => {
 });
 router.delete("/:id", async (req, res) => {
   const user = await requireUser(req);
-  const [deleted] = await db.transaction(async (tx) => {
-    const affected = await affectedPostIds(tx, req.params.id);
-    const removed = await tx
-      .delete(posts)
-      .where(and(eq(posts.id, req.params.id), eq(posts.authorId, user.id)))
-      .returning({ id: posts.id, voice: posts.voice });
-    if (removed.length) await publishLiveChange(tx, affected);
-    return removed;
-  });
+  const deleted = await db.transaction((tx) => removePost(tx, req.params.id, eq(posts.authorId, user.id)));
   if (!deleted) {
     await findPost(req.params.id);
     throw new AuthError(403, "not_post_author");

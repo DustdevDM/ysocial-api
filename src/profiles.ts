@@ -12,11 +12,11 @@ import {
 } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db/index.ts";
-import { posts, users, userFollows } from "./db/schema.ts";
+import { posts, users, userFollows, userHandles } from "./db/schema.ts";
 import { profileReposts } from "./feed-entries.ts";
 import { AuthError } from "./auth/provider.ts";
 import { postSelection, serializePost } from "./post-data.ts";
-import { userSelection } from "./user-data.ts";
+import { banDetailsSelection, publicProfileSelection, userSelection } from "./user-data.ts";
 import { recordNotification } from "./notification-events.ts";
 
 const router = Router();
@@ -70,9 +70,9 @@ router.get("/:handle/availability", async (req, res) => {
   const handle = handleSchema.safeParse(req.params.handle);
   if (!handle.success) throw new AuthError(400, "invalid_handle");
   const [existing] = await db
-    .select({ id: users.id })
-    .from(users)
-    .where(eq(users.handle, handle.data))
+    .select({ id: userHandles.userId })
+    .from(userHandles)
+    .where(eq(userHandles.handle, handle.data))
     .limit(1);
   const available = !existing || existing.id === (await readViewerId(req));
   res.json({ available });
@@ -132,18 +132,20 @@ router.get("/:handle", async (req, res) => {
   const [profile] = await db
     .select({
       ...userSelection,
-      bio: users.bio,
-      bannerCrop: users.bannerCrop,
-      bannerUrl: sql<
-        string | null
-      >`case when ${users.bannerKey} is null then ${users.bannerExternalUrl} else '/api/' || ${users.bannerKey} end`,
+      ...publicProfileSelection,
       createdAt: users.createdAt,
-      followerCount: sql<number>`(select count(*)::int from ${userFollows} where ${userFollows.followingId} = ${users.id})`,
-      followingCount: sql<number>`(select count(*)::int from ${userFollows} where ${userFollows.followerId} = ${users.id})`,
+      ...banDetailsSelection,
     })
     .from(users)
-    .where(eq(users.handle, req.params.handle));
+    .where(eq(users.id, db.select({ id: userHandles.userId }).from(userHandles).where(eq(userHandles.handle, req.params.handle))));
   if (!profile) throw new AuthError(404, "profile_not_found");
+  if (profile.banReason) {
+    res.json({
+      profile, isFollowing: false, isFollowedBy: false,
+      posts: [], replies: [], reposts: [], repostedBy: {}, serverNow: new Date().toISOString(),
+    });
+    return;
+  }
   const viewerId = await readViewerId(req);
   const relationships = viewerId
     ? await db
@@ -211,7 +213,7 @@ router.get("/:handle", async (req, res) => {
           .select(postSelection(viewerId))
           .from(posts)
           .innerJoin(users, eq(users.id, posts.authorId))
-          .where(inArray(posts.id, ancestorIds));
+          .where(and(inArray(posts.id, ancestorIds), isNull(users.bannedAt)));
   const ancestorsById = new Map(
     ancestors.map((post) => [post.id, serializePost(post)]),
   );
@@ -248,7 +250,7 @@ async function setFollow(req: Request, follow: boolean) {
     const [target] = await tx
       .select({ id: users.id })
       .from(users)
-      .where(eq(users.handle, handle.data))
+      .where(eq(users.id, tx.select({ id: userHandles.userId }).from(userHandles).where(eq(userHandles.handle, handle.data))))
       .for("no key update");
     if (!target) throw new AuthError(404, "profile_not_found");
     if (target.id === viewer.id) throw new AuthError(400, "cannot_follow_self");

@@ -123,12 +123,12 @@ await test("avatar upload, persistence, access, and failures", async (t) => {
     const {
       rows: [alice],
     } = await pool.query(
-      "INSERT INTO users (handle, display_name) VALUES ('avatar_alice', 'Alice') RETURNING id",
+      "INSERT INTO users (handle, display_name, approved_at) VALUES ('avatar_alice', 'Alice', now()) RETURNING id",
     );
     const {
       rows: [bob],
     } = await pool.query(
-      "INSERT INTO users (handle, display_name) VALUES ('avatar_bob', 'Bob') RETURNING id",
+      "INSERT INTO users (handle, display_name, approved_at) VALUES ('avatar_bob', 'Bob', now()) RETURNING id",
     );
     const {
       rows: [identity],

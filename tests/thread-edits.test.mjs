@@ -35,7 +35,7 @@ test("thread view, edit history and friend likes", async () => {
     const { hash } = await import("../src/auth/secrets.ts");
     async function signIn(handle) {
       const { rows: [user] } = await pool.query(
-        "INSERT INTO users (handle) VALUES ($1) RETURNING id",
+        "INSERT INTO users (handle, approved_at) VALUES ($1, now()) RETURNING id",
         [handle],
       );
       const { rows: [identity] } = await pool.query(

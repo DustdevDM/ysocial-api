@@ -1,10 +1,11 @@
-import { Router } from "express";
+import { Router, type Request, type Response } from "express";
 import { isDraining } from "./health.ts";
-import { canOpenLiveStream, openLiveStream } from "./live-events.ts";
+import { readViewerId } from "./auth/request.ts";
+import { canOpenLiveStream, openLiveStream, type LiveAudience } from "./live-events.ts";
 
 const router = Router();
 
-router.get("/", (req, res) => {
+export function serveLiveStream(req: Request, res: Response, audience: LiveAudience = "feed") {
   if (isDraining() || !canOpenLiveStream()) {
     res.set("Retry-After", "5").status(503).json({ error: "live_unavailable" });
     return;
@@ -19,7 +20,12 @@ router.get("/", (req, res) => {
   });
   res.flushHeaders();
   res.write("retry: 3000\n\n");
-  openLiveStream(res);
+  openLiveStream(res, audience);
+}
+
+router.get("/", async (req, res) => {
+  const viewerId = await readViewerId(req);
+  serveLiveStream(req, res, viewerId ? { feedFor: viewerId } : "feed");
 });
 
 export default router;

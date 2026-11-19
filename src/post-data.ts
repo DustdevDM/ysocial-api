@@ -1,7 +1,15 @@
 import { sql } from "drizzle-orm";
-import { postLikes, postReposts, posts } from "./db/schema.ts";
-import { userSelection } from "./user-data.ts";
+import { alias } from "drizzle-orm/pg-core";
+import { postLikes, postReposts, posts, users } from "./db/schema.ts";
+import { avatarUrlSelection, userSelection } from "./user-data.ts";
 import type { PollDefinition } from "./poll-schema.ts";
+
+const previewAvatarUrl = avatarUrlSelection(alias(users, "u"));
+
+export const visiblePostAuthor = sql`exists (
+  select 1 from users visible_author
+  where visible_author.id = ${posts.authorId} and visible_author.banned_at is null
+)`;
 
 export const postFields = {
   id: posts.id,
@@ -61,11 +69,11 @@ export type QuotedPost = {
 };
 export type PostQuote = { state: "available"; post: QuotedPost } | { state: "unavailable" };
 export const quoteSelection = {
-  quotes: sql<number>`(select count(*)::int from posts q where q.quoted_post_id = ${posts.id})`,
+  quotes: sql<number>`(select count(*)::int from posts q join users u on u.id = q.author_id
+    where q.quoted_post_id = ${posts.id} and u.banned_at is null)`,
   // The embedded post, one level deep. Null for posts that are not quotes.
   quote: sql<PostQuote | null>`case when ${posts.isQuote} then (
-    case when ${posts.quotedPostId} is null then jsonb_build_object('state', 'unavailable')
-    else (
+    coalesce((
       select jsonb_build_object('state', 'available', 'post', jsonb_build_object(
         'id', q.id, 'content', q.content, 'gif', q.gif,
         'createdAt', q.created_at, 'editedAt', q.edited_at, 'parentId', q.parent_id,
@@ -73,10 +81,10 @@ export const quoteSelection = {
         'mentions', (select coalesce(jsonb_agg(jsonb_build_object('id', mu.id, 'handle', mu.handle, 'username', qm.handle)), '[]'::jsonb)
           from post_mentions qm join users mu on mu.id = qm.user_id where qm.post_id = q.id),
         'author', jsonb_build_object('id', u.id, 'handle', u.handle, 'displayName', u.display_name,
-          'avatarUrl', coalesce('/api/' || u.avatar_key, (select ai.picture from auth_identities ai where ai.user_id = u.id and ai.deleted_at is null)))
+          'avatarUrl', ${previewAvatarUrl})
       ))
-      from posts q join users u on u.id = q.author_id where q.id = ${posts.quotedPostId}
-    ) end
+      from posts q join users u on u.id = q.author_id where q.id = ${posts.quotedPostId} and u.banned_at is null
+    ), jsonb_build_object('state', 'unavailable'))
   ) end`,
   // Who a reply answers, so a reply shown outside its thread still has context.
   replyTo: sql<{ id: string; handle: string; displayName: string } | null>`(
@@ -124,7 +132,7 @@ export function friendLikeSelection(viewerId: string | null) {
         : sql<{ id: string; handle: string; displayName: string; avatarUrl: string | null }[]>`(
             select coalesce(json_agg(t), '[]'::json) from (
               select u.id, u.handle, u.display_name as "displayName",
-                coalesce('/api/' || u.avatar_key, (select ai.picture from auth_identities ai where ai.user_id = u.id and ai.deleted_at is null)) as "avatarUrl"
+                ${previewAvatarUrl} as "avatarUrl"
               from post_likes pl join users u on u.id = pl.user_id
               where ${friendLikeFilter(viewerId)}
               order by u.handle
@@ -153,7 +161,8 @@ export const postSelection = (viewerId: string | null) => ({
       select reply.id from posts reply
       join descendants on reply.parent_id = descendants.id
     )
-    select count(*)::int from descendants
+    select count(*)::int from descendants d join posts p on p.id = d.id
+    join users u on u.id = p.author_id where u.banned_at is null
   )`,
   author: userSelection,
 });

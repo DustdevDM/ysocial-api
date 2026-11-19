@@ -5,7 +5,7 @@ import { env } from "./config.ts";
 import { db } from "./db/index.ts";
 
 const CHANNELS = { live_posts: "post", live_changes: "change" } as const;
-const MAX_CHANGED_IDS = 100;
+export const MAX_CHANGED_IDS = 100;
 const HEARTBEAT_MS = 20_000;
 const MAX_BUFFERED_BYTES = 64 * 1024;
 
@@ -18,7 +18,10 @@ export type LivePost = {
   reposted?: boolean;
 };
 
-const streams = new Set<Response>();
+export type LiveAudience = "feed" | "waitlist" | { approvalFor: string } | { feedFor: string };
+const isFeedAudience = (audience: LiveAudience) =>
+  audience === "feed" || (typeof audience === "object" && "feedFor" in audience);
+const streams = new Map<Response, LiveAudience>();
 
 function write(stream: Response, frame: string) {
   if (stream.writableLength > MAX_BUFFERED_BYTES) {
@@ -28,21 +31,21 @@ function write(stream: Response, frame: string) {
   stream.write(frame);
 }
 
-function broadcast(frame: string) {
-  for (const stream of streams) write(stream, frame);
+function broadcast(frame: string, includes: (audience: LiveAudience) => boolean = () => true) {
+  for (const [stream, audience] of streams) if (includes(audience)) write(stream, frame);
 }
 
 export function canOpenLiveStream() {
   return streams.size < env.LIVE_MAX_STREAMS;
 }
 
-export function openLiveStream(stream: Response) {
-  streams.add(stream);
+export function openLiveStream(stream: Response, audience: LiveAudience = "feed") {
+  streams.set(stream, audience);
   stream.on("close", () => streams.delete(stream));
 }
 
 export function closeLiveStreams() {
-  for (const stream of streams) stream.end();
+  for (const stream of streams.keys()) stream.end();
   streams.clear();
 }
 
@@ -58,6 +61,14 @@ export async function publishLiveChange(tx: Transaction, ids: string[]) {
   await tx.execute(
     sql`select pg_notify('live_changes', ${JSON.stringify({ ids: unique })})`,
   );
+}
+
+export async function publishWaitlistChange(tx: Transaction, approvedUserId = "") {
+  await tx.execute(sql`select pg_notify('live_waitlist', ${approvedUserId})`);
+}
+
+export async function publishAccountChange(tx: Transaction, userId: string) {
+  await tx.execute(sql`select pg_notify('live_account', ${userId})`);
 }
 
 export async function affectedPostIds(tx: Transaction, id: string) {
@@ -112,9 +123,22 @@ export function startLiveEvents() {
       retry();
     };
     next.on("notification", (message) => {
+      if (message.channel === "live_waitlist") {
+        broadcast("event: waitlist\ndata: {}\n\n", (audience) => audience === "waitlist");
+        if (message.payload) {
+          broadcast("event: approval\ndata: {}\n\n",
+            (audience) => typeof audience === "object" && "approvalFor" in audience && audience.approvalFor === message.payload);
+        }
+        return;
+      }
+      if (message.channel === "live_account") {
+        broadcast("event: account\ndata: {}\n\n", (audience) =>
+          typeof audience === "object" && (("feedFor" in audience ? audience.feedFor : audience.approvalFor) === message.payload));
+        return;
+      }
       const event = CHANNELS[message.channel as keyof typeof CHANNELS];
       if (event && message.payload)
-        broadcast(`event: ${event}\ndata: ${message.payload}\n\n`);
+        broadcast(`event: ${event}\ndata: ${message.payload}\n\n`, isFeedAudience);
     });
     next.on("error", lose);
     next.on("end", lose);
@@ -122,8 +146,10 @@ export function startLiveEvents() {
       await next.connect();
       for (const channel of Object.keys(CHANNELS))
         await next.query(`listen ${channel}`);
+      await next.query("listen live_waitlist");
+      await next.query("listen live_account");
       delay = 500;
-      if (connectedBefore) broadcast("event: resync\ndata: {}\n\n");
+      broadcast("event: resync\ndata: {}\n\n", (audience) => connectedBefore || !isFeedAudience(audience));
       connectedBefore = true;
       if (stopped) lose();
     } catch {

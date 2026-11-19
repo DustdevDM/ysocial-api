@@ -29,6 +29,7 @@ export async function reconcileProfiles() {
       and(
         eq(authIdentities.issuer, issuer),
         isNull(authIdentities.deletedAt),
+        eq(authIdentities.sessionVersion, authSessions.sessionVersion),
         gt(authSessions.expiresAt, new Date()),
       ),
     );

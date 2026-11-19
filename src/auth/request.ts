@@ -12,8 +12,8 @@ export function cookie(req: Request, key: string) {
       ?.slice(key.length + 1) ?? ""
   );
 }
-export function requireOrigin(req: Request) {
-  if (req.headers.origin !== env.APP_ORIGIN)
+export function requireOrigin(req: Request, origin = env.APP_ORIGIN) {
+  if (req.headers.origin !== origin)
     throw new AuthError(403, "invalid_origin");
 }
 
@@ -32,7 +32,14 @@ export async function readViewerId(req: Request): Promise<string | null> {
 
 export async function requireUser(req: Request) {
   requireOrigin(req);
-  return requireSessionUser(req);
+  return requireApprovedUser(req);
+}
+
+export async function requireApprovedUser(req: Request) {
+  const user = await requireSessionUser(req);
+  if (user.bannedAt) throw new AuthError(403, "account_banned");
+  if (!user.approvedAt) throw new AuthError(403, "approval_required");
+  return user;
 }
 
 // Safe reads authenticate the session without requiring the Origin header

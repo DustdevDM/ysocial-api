@@ -64,6 +64,16 @@ test("staff sessions can read admin data and role changes take effect on the nex
     for (const role of ["user", "admin", "moderator", "og"]) {
       await database.pool.query("UPDATE users SET role = $1 WHERE id = $2", [role, user.id]);
       const allowed = role === "admin" || role === "moderator";
+      if (allowed) {
+        for (const path of ["/users", `/user/${user.id}`]) {
+          const permission = await fetch(base + "/api/admin" + path, { headers });
+          assert.equal(permission.status, 200);
+          assert.equal((await permission.json()).canEditBadges, role === "admin");
+        }
+        const options = await fetch(base + "/api/admin/badge-options", { headers });
+        assert.equal(options.status, role === "admin" ? 200 : 403);
+        if (role === "moderator") assert.deepEqual(await options.json(), { error: "admin_required" });
+      }
       for (const path of paths) {
         const response = await fetch(base + "/api/admin" + path, { headers });
         assert.equal(response.status, allowed ? (path === "/session" ? 204 : 200) : 403, `${role} ${path}`);
@@ -188,6 +198,81 @@ test("staff sessions can read admin data and role changes take effect on the nex
     assert.equal(second.hasNextPage, false);
     assert.ok(first.users.every((row) => row.canEditRole && row.id !== second.users[0].id));
     const ids = [user.id, second.users[0].id];
+    const badgePath = base + "/api/admin/users/" + user.id + "/badges";
+    const changeBadge = (change, cookie = staffHeaders) => fetch(badgePath, {
+      method: "PATCH",
+      headers: { ...cookie, Origin: env.ADMIN_ORIGIN, "Content-Type": "application/json" },
+      body: JSON.stringify(change),
+    });
+    const publicBadgeProfile = async (handle) => {
+      const response = await fetch(base + "/api/profiles/" + handle);
+      assert.equal(response.status, 200);
+      return (await response.json()).profile;
+    };
+    const adminProfile = await publicBadgeProfile("ytest");
+    assert.equal(Object.hasOwn(adminProfile, "isAdmin"), false);
+    assert.equal(adminProfile.isOg, false);
+    assert.deepEqual(adminProfile.badges, []);
+    const optionsResponse = await fetch(base + "/api/admin/badge-options", { headers: staffHeaders });
+    assert.equal(optionsResponse.status, 200);
+    const options = await optionsResponse.json();
+    assert.ok(options.presets.every(({ icon }) => options.icons.includes(icon)));
+    const developerPreset = options.presets.find(({ label }) => label === "Developer");
+    assert.deepEqual(developerPreset, { label: "Developer", icon: "terminal", tooltip: "Developed this" });
+    assert.ok(options.icons.includes("bike"));
+    const icon = await fetch(base + "/api/profiles/badge-icons/bike");
+    assert.equal(icon.status, 200);
+    assert.match(icon.headers.get("content-type"), /^image\/svg\+xml/);
+    assert.match(await icon.text(), /lucide-bike/);
+
+    const add = { action: "add", icon: "bike", tooltip: "Organized a group ride" };
+    assert.equal((await changeBadge(add, headers)).status, 403);
+    assert.equal((await changeBadge({ ...add, icon: "unknown-icon" })).status, 400);
+    assert.equal((await changeBadge({ ...add, tooltip: " " })).status, 400);
+    const assigned = await changeBadge(add);
+    assert.equal(assigned.status, 200);
+    const { badges: [badge] } = await assigned.json();
+    assert.equal(badge.tooltip, add.tooltip);
+    assert.equal(badge.icon, add.icon);
+    assert.deepEqual((await changeBadge(add).then(response => response.json())).badges, [badge]);
+    const decorated = await publicBadgeProfile("staff_test");
+    assert.equal(Object.hasOwn(decorated, "isAdmin"), false);
+    assert.equal(decorated.isOg, true);
+    assert.deepEqual(decorated.badges, [badge]);
+    assert.deepEqual((await list("q=staff_test")).users[0].badges, [badge]);
+    const removed = await changeBadge({ action: "remove", id: badge.id });
+    assert.equal(removed.status, 200);
+    assert.deepEqual((await publicBadgeProfile("staff_test")).badges, []);
+    const badgeActivity = await fetch(base + "/api/admin/activity", { headers: staffHeaders });
+    assert.equal(badgeActivity.status, 200);
+    const { entries: badgeEntries } = await badgeActivity.json();
+    assert.deepEqual(
+      badgeEntries.filter(({ action }) => action === "addBadge" || action === "removeBadge")
+        .map(({ action, detail }) => [action, detail]).sort(),
+      [["addBadge", "bike: Organized a group ride"], ["removeBadge", "bike: Organized a group ride"]],
+    );
+
+    const developerBadge = await changeBadge({
+      action: "add", icon: developerPreset.icon, tooltip: developerPreset.tooltip,
+    });
+    assert.equal(developerBadge.status, 200);
+    const { badges: assignedDeveloperBadges } = await developerBadge.json();
+    assert.deepEqual((await publicBadgeProfile("staff_test")).badges, assignedDeveloperBadges);
+    assert.equal(assignedDeveloperBadges[0].tooltip, "Developed this");
+
+    for (let number = 1; number <= 8; number++) {
+      assert.equal((await changeBadge({ ...add, tooltip: "Badge " + number })).status, 200);
+    }
+    const finalAdds = ["Final badge A", "Final badge B"].map((tooltip) => ({ ...add, tooltip }));
+    const results = await Promise.all(finalAdds.map((change) => changeBadge(change)));
+    assert.deepEqual(results.map(({ status }) => status).sort(), [200, 400]);
+    const rejected = results.findIndex(({ status }) => status === 400);
+    assert.deepEqual(await results[rejected].json(), { error: "badge_limit_reached" });
+    const fullProfile = await publicBadgeProfile("staff_test");
+    assert.equal(fullProfile.badges.length, 10);
+    assert.ok(!fullProfile.badges.some(({ tooltip }) => tooltip === finalAdds[rejected].tooltip));
+    assert.equal((await changeBadge(finalAdds[1 - rejected])).status, 200);
+
     assert.equal((await update(ids, "moderator", staffHeaders, "https://other.invalid")).status, 403);
     assert.equal((await update(ids, "unknown")).status, 400);
     assert.equal((await update([...ids, randomUUID()], "moderator")).status, 404);

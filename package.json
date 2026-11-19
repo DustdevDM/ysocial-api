@@ -38,6 +38,7 @@
     "ipaddr.js": "^2.5.0",
     "jose": "^6.2.14",
     "linkifyjs": "4.4.0",
+    "lucide-static": "1.70.0",
     "parse5": "^8.1.1",
     "pg": "^8.23.1",
     "satori": "^0.63.2",

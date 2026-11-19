@@ -1,5 +1,5 @@
 {
-  "id": "732975f0-9795-412c-bc95-65cf6c53f0a2",
+  "id": "ec326eff-1c26-4573-8a7b-d3775e86b985",
   "prevId": "afa88a08-2bc0-4b6b-ae1d-96d2ed43a24f",
   "version": "7",
   "dialect": "postgresql",
@@ -1281,21 +1281,6 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
-        },
-        "posts_content_search_idx": {
-          "name": "posts_content_search_idx",
-          "columns": [
-            {
-              "expression": "to_tsvector('simple', \"content\")",
-              "asc": true,
-              "isExpression": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "gin",
-          "with": {}
         }
       },
       "foreignKeys": {
@@ -1719,6 +1704,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'user'"
+        },
+        "badges": {
+          "name": "badges",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'[]'::jsonb"
         },
         "approved_at": {
           "name": "approved_at",

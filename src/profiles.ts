@@ -18,12 +18,22 @@ import { AuthError } from "./auth/provider.ts";
 import { postSelection, serializePost } from "./post-data.ts";
 import { banDetailsSelection, publicProfileSelection, userSelection } from "./user-data.ts";
 import { recordNotification } from "./notification-events.ts";
+import { badgeIconDirectory, isBadgeIcon } from "./profile-badges.ts";
 
 const router = Router();
 const handleSchema = z.string().regex(/^[a-z0-9_]{3,32}$/);
 router.use((_req, res, next) => {
   res.set("Cache-Control", "no-store");
   next();
+});
+router.get("/badge-icons/:icon", (req, res) => {
+  const { icon } = req.params;
+  if (!isBadgeIcon(icon)) throw new AuthError(404, "badge_icon_not_found");
+  res.set({
+    "Cache-Control": "public, max-age=86400",
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+  });
+  res.sendFile(icon + ".svg", { root: badgeIconDirectory });
 });
 router.get("/suggestions", async (req, res) => {
   // Not requireUser: that also demands an Origin header, which browsers do not
@@ -133,6 +143,8 @@ router.get("/:handle", async (req, res) => {
     .select({
       ...userSelection,
       ...publicProfileSelection,
+      isOg: sql<boolean>`${users.role} = 'og'`,
+      badges: users.badges,
       createdAt: users.createdAt,
       ...banDetailsSelection,
     })

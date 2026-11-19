@@ -67,7 +67,9 @@ test("mentions resolve, notify, edit, and deduplicate through the API", async ()
       assert.equal(response.status, 200);
       return response.json();
     }
-    const { rows: [target] } = await pool.query("INSERT INTO users (handle) VALUES ('tag_target') RETURNING id");
+    const { rows: [target] } = await pool.query("INSERT INTO users (handle, role) VALUES ('tag_target', 'og') RETURNING id");
+    assert.equal((await get('/api/profiles/tag_target')).profile.isOg, true);
+    assert.equal((await get('/api/profiles/reply_author')).profile.isOg, false);
     await pool.query("INSERT INTO users (handle) VALUES ('tag_tom'), ('tag_tina'), ('other_tag'), ('tag_tim')");
     const anonymous = await fetch(base + '/api/profiles/suggestions?q=tag', { headers: { Origin: env.APP_ORIGIN } });
     assert.equal(anonymous.status, 401);
@@ -87,7 +89,7 @@ test("mentions resolve, notify, edit, and deduplicate through the API", async ()
       const response = await request('/api/posts', 'POST', { content, clientId: id, attachmentIds: [] });
       assert.equal(response.status, 201);
       const { post } = await response.json();
-      assert.deepEqual(post.mentions, [{ id: target.id, handle: 'tag_target', username: 'tag_target' }]);
+      assert.deepEqual(post.mentions, [{ id: target.id, handle: 'tag_target', username: 'tag_target', isOg: true }]);
     }
     const events = () => pool.query("SELECT * FROM notifications WHERE kind = 'mention' AND post_id = $1", [id]);
     assert.equal((await events()).rows.length, 1);
@@ -110,12 +112,12 @@ test("mentions resolve, notify, edit, and deduplicate through the API", async ()
     const backfill = migration.slice(migration.indexOf('-- Resolve existing'));
     await pool.query(backfill);
     await pool.query(backfill);
-    assert.deepEqual((await get('/api/posts/' + old.id)).post.mentions, [{ id: target.id, handle: 'tag_target', username: 'tag_target' }]);
+    assert.deepEqual((await get('/api/posts/' + old.id)).post.mentions, [{ id: target.id, handle: 'tag_target', username: 'tag_target', isOg: true }]);
     await pool.query("UPDATE users SET handle = 'renamed_target' WHERE id = $1", [target.id]);
     assert.equal((await get('/api/posts/' + old.id)).post.mentions[0].handle, 'renamed_target');
     const editedAlias = await request('/api/posts/' + id, 'PATCH', { content: 'Still tagging @tag_target' });
     assert.equal(editedAlias.status, 200);
-    assert.deepEqual((await editedAlias.json()).post.mentions, [{ id: target.id, handle: 'renamed_target', username: 'tag_target' }]);
+    assert.deepEqual((await editedAlias.json()).post.mentions, [{ id: target.id, handle: 'renamed_target', username: 'tag_target', isOg: true }]);
     const newAlias = await request('/api/posts/' + id + '/replies', 'POST', { content: '@tag_target and @renamed_target', attachmentIds: [] });
     assert.equal(newAlias.status, 201);
     const tagged = (await newAlias.json()).post.mentions;

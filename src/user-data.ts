@@ -17,6 +17,7 @@ export const userSelection = {
   handle: users.handle,
   displayName: users.displayName,
   avatarUrl: avatarUrlSelection(users),
+  isOg: sql<boolean>`${users.role} = 'og'`,
 };
 
 export const banDetailsSelection = {

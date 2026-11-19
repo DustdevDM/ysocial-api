@@ -64,8 +64,8 @@ export type QuotedPost = {
   parentId: string | null;
   pollTitle: string | null;
   isQuote: boolean;
-  mentions: { id: string; handle: string; username: string }[];
-  author: { id: string; handle: string; displayName: string; avatarUrl: string | null };
+  mentions: { id: string; handle: string; username: string; isOg: boolean }[];
+  author: { id: string; handle: string; displayName: string; avatarUrl: string | null; isOg: boolean };
 };
 export type PostQuote = { state: "available"; post: QuotedPost } | { state: "unavailable" };
 export const quoteSelection = {
@@ -78,17 +78,17 @@ export const quoteSelection = {
         'id', q.id, 'content', q.content, 'gif', q.gif,
         'createdAt', q.created_at, 'editedAt', q.edited_at, 'parentId', q.parent_id,
         'pollTitle', q.poll->>'title', 'isQuote', q.is_quote,
-        'mentions', (select coalesce(jsonb_agg(jsonb_build_object('id', mu.id, 'handle', mu.handle, 'username', qm.handle)), '[]'::jsonb)
+        'mentions', (select coalesce(jsonb_agg(jsonb_build_object('id', mu.id, 'handle', mu.handle, 'username', qm.handle, 'isOg', mu.role = 'og')), '[]'::jsonb)
           from post_mentions qm join users mu on mu.id = qm.user_id where qm.post_id = q.id),
         'author', jsonb_build_object('id', u.id, 'handle', u.handle, 'displayName', u.display_name,
-          'avatarUrl', ${previewAvatarUrl})
+          'avatarUrl', ${previewAvatarUrl}, 'isOg', u.role = 'og')
       ))
       from posts q join users u on u.id = q.author_id where q.id = ${posts.quotedPostId} and u.banned_at is null
     ), jsonb_build_object('state', 'unavailable'))
   ) end`,
   // Who a reply answers, so a reply shown outside its thread still has context.
-  replyTo: sql<{ id: string; handle: string; displayName: string } | null>`(
-    select jsonb_build_object('id', pp.id, 'handle', pu.handle, 'displayName', pu.display_name)
+  replyTo: sql<{ id: string; handle: string; displayName: string; isOg: boolean } | null>`(
+    select jsonb_build_object('id', pp.id, 'handle', pu.handle, 'displayName', pu.display_name, 'isOg', pu.role = 'og')
     from posts pp join users pu on pu.id = pp.author_id where pp.id = ${posts.parentId}
   )`,
 };
@@ -148,8 +148,8 @@ export const postSelection = (viewerId: string | null) => ({
   ...quoteSelection,
   ...postFields,
   poll: pollSelection(viewerId),
-  mentions: sql<{ id: string; handle: string; username: string }[]>`(
-    select coalesce(json_agg(json_build_object('id', u.id, 'handle', u.handle, 'username', m.handle)), '[]'::json)
+  mentions: sql<{ id: string; handle: string; username: string; isOg: boolean }[]>`(
+    select coalesce(json_agg(json_build_object('id', u.id, 'handle', u.handle, 'username', m.handle, 'isOg', u.role = 'og')), '[]'::json)
     from post_mentions m join users u on u.id = m.user_id where m.post_id = ${posts.id}
   )`,
   topics: sql<string[]>`coalesce((select array_agg(pt.topic order by pt.topic) from post_topics pt where pt.post_id = ${posts.id}), '{}')`,

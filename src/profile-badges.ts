@@ -11,6 +11,7 @@ const badgeIconNames = new Set(readdirSync(badgeIconDirectory)
   .sort());
 
 export const badgePresets = [
+  { label: "Developer", icon: "terminal", tooltip: "Developed this" },
   { label: "Bug Hunter", icon: "bug", tooltip: "Helped find and report bugs" },
   { label: "Community Contributor", icon: "heart-handshake", tooltip: "Contributed to the community" },
   { label: "Event Winner", icon: "trophy", tooltip: "Won a community event" },

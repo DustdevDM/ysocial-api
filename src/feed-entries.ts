@@ -5,7 +5,7 @@ import { postSelection, repostVisibleSql, serializePost } from "./post-data.ts";
 import { userSelection } from "./user-data.ts";
 import { attachSelfReplies } from "./self-replies.ts";
 
-type FeedUser = Pick<typeof users.$inferSelect, "id" | "handle" | "displayName"> & { avatarUrl: string | null; isOg: boolean };
+type FeedUser = { id: string; handle: string; displayName: string; avatarUrl: string | null };
 type Audience = "public" | "friends";
 type PostRecord = ReturnType<typeof serializePost<Awaited<ReturnType<typeof selectPosts>>[number]>>;
 

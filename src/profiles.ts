@@ -143,7 +143,7 @@ router.get("/:handle", async (req, res) => {
     .select({
       ...userSelection,
       ...publicProfileSelection,
-      isAdmin: sql<boolean>`${users.role} = 'admin'`,
+      isOg: sql<boolean>`${users.role} = 'og'`,
       badges: users.badges,
       createdAt: users.createdAt,
       ...banDetailsSelection,

@@ -108,7 +108,12 @@ router.get("/user/:id", async (req, res) => {
     updatedAt: users.updatedAt,
   }).from(users).where(eq(users.id, id));
   if (!user) throw new AuthError(404, "user_not_found");
-  res.json({ ...formatUser(user), kind: "user", canEditProfile: viewer.role === "admin", canModerateAccount: canModerateAccount(viewer, user) });
+  res.json({
+    ...formatUser(user), kind: "user",
+    canEditProfile: viewer.role === "admin",
+    canEditBadges: viewer.role === "admin",
+    canModerateAccount: canModerateAccount(viewer, user),
+  });
 });
 
 router.get("/post/:id", async (req, res) => {
@@ -214,6 +219,7 @@ router.get("/users", async (req, res) => {
     })),
     hasNextPage: rows.length > pageSize,
     canEditProfiles: viewer.role === "admin",
+    canEditBadges: viewer.role === "admin",
   });
 });
 
@@ -495,7 +501,8 @@ router.patch("/users/roles", async (req, res) => {
 });
 
 router.get("/badge-options", async (req, res) => {
-  await requireStaff(req);
+  const viewer = await requireStaff(req);
+  if (viewer.role !== "admin") throw new AuthError(403, "admin_required");
   res.json({ icons: badgeIcons, presets: badgePresets });
 });
 
@@ -503,6 +510,7 @@ const badgeChange = z.discriminatedUnion("action", [
   badgeDetails.extend({ action: z.literal("add") }),
   z.strictObject({ action: z.literal("remove"), id: z.uuid() }),
 ]);
+const maxProfileBadges = 10;
 
 router.patch("/users/:id/badges", async (req, res) => {
   const viewer = await requireAdminWrite(req);
@@ -524,11 +532,12 @@ router.patch("/users/:id/badges", async (req, res) => {
     if (change.action === "add") {
       const { icon, tooltip } = change;
       if (target.badges.some((badge) => badge.icon === icon && badge.tooltip === tooltip)) return target.badges;
+      if (target.badges.length >= maxProfileBadges) throw new AuthError(400, "badge_limit_reached");
       const updated = [...target.badges, { id: randomUUID(), icon, tooltip }];
       await tx.update(users).set({ badges: updated }).where(eq(users.id, id));
       await tx.insert(moderationActivity).values({
         actorId: actor.id, actorHandle: actor.handle, targetId: id, targetHandle: target.handle,
-        action: "addBadge", detail: tooltip,
+        action: "addBadge", detail: `${icon}: ${tooltip}`,
       });
       return updated;
     }
@@ -539,7 +548,7 @@ router.patch("/users/:id/badges", async (req, res) => {
     await tx.update(users).set({ badges: updated }).where(eq(users.id, id));
     await tx.insert(moderationActivity).values({
       actorId: actor.id, actorHandle: actor.handle, targetId: id, targetHandle: target.handle,
-      action: "removeBadge", detail: removed.tooltip,
+      action: "removeBadge", detail: `${removed.icon}: ${removed.tooltip}`,
     });
     return updated;
   });

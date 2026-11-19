@@ -3,6 +3,7 @@ import { and, eq, lte, sql } from "drizzle-orm";
 import { db } from "./db/index.ts";
 import {
   authSessions,
+  authIdentities,
   notifications,
   posts,
   pushDeliveries,
@@ -12,6 +13,7 @@ import {
 import { env } from "./config.ts";
 import { userSelection } from "./user-data.ts";
 import { notificationPreview } from "./notification-content.ts";
+import { visiblePostAuthor } from "./post-data.ts";
 
 const descriptions = {
   like: "liked your post",
@@ -56,7 +58,7 @@ export async function flushPushDeliveries(send = webpush.sendNotification) {
         })
         .from(notifications)
         .innerJoin(users, eq(users.id, notifications.actorId))
-        .leftJoin(posts, eq(posts.id, notifications.postId))
+        .leftJoin(posts, and(eq(posts.id, notifications.postId), visiblePostAuthor))
         .innerJoin(
           pushSubscriptions,
           eq(pushSubscriptions.id, job.subscriptionId),
@@ -65,7 +67,17 @@ export async function flushPushDeliveries(send = webpush.sendNotification) {
           authSessions,
           eq(authSessions.tokenHash, pushSubscriptions.sessionHash),
         )
-        .where(eq(notifications.id, job.notificationId));
+        .innerJoin(authIdentities, and(
+          eq(authIdentities.id, authSessions.identityId),
+          eq(authIdentities.userId, pushSubscriptions.userId),
+          eq(authIdentities.sessionVersion, authSessions.sessionVersion),
+          sql`${authIdentities.deletedAt} is null`,
+        ))
+        .where(and(eq(notifications.id, job.notificationId), sql`exists (
+          select 1 from users recipient
+          where recipient.id = ${pushSubscriptions.userId}
+            and recipient.banned_at is null
+        )`));
       if (
         !event ||
         event.notification.readAt ||

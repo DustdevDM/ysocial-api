@@ -3,8 +3,9 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db/index.ts";
-import { mediaDeletions, posts } from "./db/schema.ts";
-import { requireSessionUser, requireUser } from "./auth/request.ts";
+import { mediaDeletions, posts, users } from "./db/schema.ts";
+import { cookie, requireSessionUser, requireUser } from "./auth/request.ts";
+import { readSession } from "./auth/session.ts";
 import { AuthError } from "./auth/provider.ts";
 import { getAvatar, requireAvatarStorage } from "./storage/r2.ts";
 import { flushMediaDeletions } from "./storage/media-lifecycle.ts";
@@ -127,11 +128,19 @@ router.get("/:file", async (req, res) => {
     throw new AuthError(404, "voice_not_found");
   const key = `voices/${file.data}`;
   const [post] = await db
-    .select({ id: posts.id })
+    .select({ bannedAt: users.bannedAt })
     .from(posts)
+    .innerJoin(users, eq(posts.authorId, users.id))
     .where(eq(sql`${posts.voice}->>'key'`, key))
     .limit(1);
   if (!post) throw new AuthError(404, "voice_not_found");
+  res.set("Cache-Control", "private, no-store");
+  if (post.bannedAt) {
+    const session = await readSession(cookie(req, "session"));
+    const viewer = session.kind === "authenticated" ? session.user : null;
+    if (!viewer?.approvedAt || viewer.bannedAt || (viewer.role !== "admin" && viewer.role !== "moderator"))
+      throw new AuthError(404, "voice_not_found");
+  }
   const body = Buffer.from(await getAvatar(key));
   // Parse byte ranges to support seeking without streaming the entire recording.
   res.set("Accept-Ranges", "bytes");

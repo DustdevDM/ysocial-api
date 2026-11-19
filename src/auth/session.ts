@@ -4,7 +4,7 @@ import { authSessions, authIdentities, users } from "../db/schema.ts";
 import { env } from "../config.ts";
 import { AuthError, providerPost, tokensSchema } from "./provider.ts";
 import { decrypt, encrypt, hash } from "./secrets.ts";
-import { userSelection } from "../user-data.ts";
+import { banDetailsSelection, userSelection } from "../user-data.ts";
 
 export function readSession(token: string) {
   return readSessionHash(hash(token));
@@ -20,6 +20,12 @@ export async function readSessionHash(tokenHash: string) {
         and(
           eq(authSessions.tokenHash, tokenHash),
           gt(authSessions.expiresAt, new Date()),
+          sql`exists (
+            select 1 from auth_identities identity
+            where identity.id = auth_sessions.identity_id
+              and identity.deleted_at is null
+              and identity.session_version = auth_sessions.session_version
+          )`,
         ),
       )
       .for("update");
@@ -73,22 +79,27 @@ export async function readSessionHash(tokenHash: string) {
       .select()
       .from(authIdentities)
       .where(eq(authIdentities.id, session.identityId));
-    if (!identity || identity.deletedAt) {
+    if (!identity || identity.deletedAt || identity.sessionVersion !== session.sessionVersion) {
       await tx
         .delete(authSessions)
         .where(eq(authSessions.tokenHash, session.tokenHash));
       return { kind: "anonymous" } as const;
     }
-    const [user] = identity.userId
-      ? await tx
+    const user = identity.userId
+      ? (await tx
           .select({
             ...userSelection,
+            role: users.role,
+            approvedAt: users.approvedAt,
+            ...banDetailsSelection,
             bannerCrop: users.bannerCrop,
             bannerUrl: sql<string | null>`case when ${users.bannerKey} is null then ${users.bannerExternalUrl} else '/api/' || ${users.bannerKey} end`,
           })
           .from(users)
           .where(eq(users.id, identity.userId))
-      : [];
+          .limit(1)).at(0)
+      : null;
+    if (identity.userId && !user) return { kind: "anonymous" } as const;
     return { kind: "authenticated", identity, user: user ?? null } as const;
   });
   if (outcome.kind === "unavailable")

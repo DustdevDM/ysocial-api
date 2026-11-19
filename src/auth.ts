@@ -1,4 +1,6 @@
-import { cookie, requireOrigin } from "./auth/request.ts";
+import { cookie, requireOrigin, requireSessionUser } from "./auth/request.ts";
+import { publishWaitlistChange } from "./live-events.ts";
+import { serveLiveStream } from "./live.ts";
 import { createHash } from "node:crypto";
 import { Router } from "express";
 import { and, eq, gt, lt } from "drizzle-orm";
@@ -10,24 +12,32 @@ import {
   oauthTransactions,
   users,
 } from "./db/schema.ts";
-import { env } from "./config.ts";
+import { adminHandle, env, reservedAdminHandle } from "./config.ts";
 import { AuthError, exchange, providerPost } from "./auth/provider.ts";
 import { decrypt, encrypt, hash, random } from "./auth/secrets.ts";
 import { readSession } from "./auth/session.ts";
 
 const router = Router();
-const cookieOptions = {
+const callbackPath = "/auth/callback";
+const cookieOptions = (origin: string) => ({
   httpOnly: true,
-  secure: env.APP_ORIGIN.startsWith("https:"),
+  secure: origin.startsWith("https:"),
   sameSite: "lax",
   path: "/",
-} satisfies import("express").CookieOptions;
+} satisfies import("express").CookieOptions);
+function adminOrigin() {
+  if (!env.ADMIN_ORIGIN) throw new AuthError(503, "admin_login_not_configured");
+  return env.ADMIN_ORIGIN;
+}
+
 const duration = 30 * 86400000;
 router.use((_req, res, next) => {
   res.set({ "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" });
   next();
 });
-router.get("/login", async (req, res) => {
+router.get(["/login", "/admin/login"], async (req, res) => {
+  const admin = req.path.toLowerCase().startsWith("/admin/");
+  const origin = admin ? adminOrigin() : env.APP_ORIGIN;
   if (!env.SESSION_ENCRYPTION_KEY)
     throw new AuthError(503, "login_not_configured");
   const state = random(),
@@ -42,14 +52,15 @@ router.get("/login", async (req, res) => {
     state: hash(state),
     browserHash: hash(browser),
     verifier,
+    admin,
     nonce,
     expiresAt: new Date(Date.now() + 600000),
   });
-  res.cookie("oauth_browser", browser, { ...cookieOptions, maxAge: 600000 });
+  res.cookie("oauth_browser", browser, { ...cookieOptions(origin), maxAge: 600000 });
   const url = new URL(env.CNS_LOGIN_URL);
   url.search = new URLSearchParams({
     client_id: env.CNS_CLIENT_ID,
-    redirect_uri: `${env.APP_ORIGIN}/auth/callback`,
+    redirect_uri: `${origin}${callbackPath}`,
     response_type: "code",
     scope: "openid profile users:read",
     state,
@@ -60,31 +71,32 @@ router.get("/login", async (req, res) => {
   res.redirect(url.href);
 });
 router.get("/callback", async (req, res) => {
+  let admin = false;
   try {
-    const parsed = z
-      .object({
-        state: z.string().min(1).max(256),
-        code: z.string().min(1).max(4096),
-      })
-      .safeParse(req.query);
-    if (!parsed.success || !cookie(req, "oauth_browser"))
+    const state = z.string().min(1).max(256).safeParse(req.query.state);
+    const browser = cookie(req, "oauth_browser");
+    if (!state.success || !browser)
       throw new AuthError(400, "invalid_login_state");
-    const { state, code } = parsed.data;
     const [attempt] = await db
       .delete(oauthTransactions)
       .where(
         and(
-          eq(oauthTransactions.state, hash(state)),
-          eq(oauthTransactions.browserHash, hash(cookie(req, "oauth_browser"))),
+          eq(oauthTransactions.state, hash(state.data)),
+          eq(oauthTransactions.browserHash, hash(browser)),
           gt(oauthTransactions.expiresAt, new Date()),
         ),
       )
       .returning();
     if (!attempt) throw new AuthError(400, "invalid_login_state");
+    admin = attempt.admin;
+    const origin = admin ? adminOrigin() : env.APP_ORIGIN;
+    const code = z.string().min(1).max(4096).safeParse(req.query.code);
+    if (!code.success) throw new AuthError(400, "login_failed");
     const result = await exchange({
-      state,
-      code,
+      state: state.data,
+      code: code.data,
       verifier: attempt.verifier,
+      redirectUri: `${origin}${callbackPath}`,
       nonce: attempt.nonce,
     });
     const token = random();
@@ -110,44 +122,61 @@ router.get("/callback", async (req, res) => {
             displayName: result.profile.name,
             picture: result.profile.picture ?? null,
             profileSyncedAt: new Date(),
+            deletedAt: null,
           },
         })
         .returning();
-      if (identity.deletedAt) throw new AuthError(403, "account_deleted");
+      if (identity.userId && identity.username.toLowerCase() === adminHandle) {
+        await tx.update(users)
+          .set({ role: "admin" })
+          .where(and(eq(users.id, identity.userId), eq(users.handle, adminHandle)));
+      }
       await tx.insert(authSessions).values({
         tokenHash: hash(token),
         identityId: identity.id,
+        sessionVersion: identity.sessionVersion,
         encryptedTokens: encrypt(result.tokens),
         refreshAfter: new Date(Date.now() + result.tokens.expires_in * 800),
         expiresAt: new Date(Date.now() + duration),
       });
       return identity.userId;
     });
-    res.cookie("session", token, { ...cookieOptions, maxAge: duration });
-    res.redirect(userId ? "/" : "/onboarding");
+    res.cookie("session", token, { ...cookieOptions(origin), maxAge: duration });
+    res.redirect(admin || userId ? "/" : "/onboarding");
   } catch (error) {
     const code = error instanceof AuthError ? error.code : "login_failed";
-    res.redirect(`/login?error=${encodeURIComponent(code)}`);
+    res.redirect(`${admin ? "/" : "/login"}?error=${encodeURIComponent(code)}`);
   }
 });
 router.get("/me", async (req, res) => {
   const session = await readSession(cookie(req, "session"));
   if (session.kind === "anonymous") {
-    res.clearCookie("session", cookieOptions);
+    res.clearCookie("session", cookieOptions(env.APP_ORIGIN));
     res.json({ authenticated: false });
     return;
   }
   res.json({
     authenticated: true,
     needsOnboarding: !session.user,
+    pendingApproval: session.user?.approvedAt === null,
+    ban: session.user?.bannedAt ? {
+      at: session.user.bannedAt,
+      reason: session.user.banReason,
+      by: session.user.bannedBy,
+      byProfileHandle: session.user.bannedByProfileHandle,
+    } : null,
     user: session.user,
-    avatarUrl: session.user?.avatarUrl ?? session.identity.picture,
+    avatarUrl: session.user ? session.user.avatarUrl : session.identity.picture,
     suggestedHandle: /^[a-z0-9_]{3,32}$/.test(
       session.identity.username.toLowerCase(),
     )
       ? session.identity.username.toLowerCase()
       : "",
   });
+});
+router.get("/approval/live", async (req, res) => {
+  const user = await requireSessionUser(req);
+  serveLiveStream(req, res, { approvalFor: user.id });
 });
 router.post("/profile", async (req, res) => {
   requireOrigin(req);
@@ -176,13 +205,17 @@ router.post("/profile", async (req, res) => {
       .from(authIdentities)
       .where(eq(authIdentities.id, active.identityId))
       .for("update");
-    if (!identity || identity.deletedAt)
+    if (!identity || identity.deletedAt || identity.sessionVersion !== active.sessionVersion)
       throw new AuthError(401, "sign_in_required");
     if (identity.userId) throw new AuthError(409, "already_onboarded");
+    const verifiedAdmin = input.data.handle === adminHandle && identity.username.toLowerCase() === adminHandle;
+    if (input.data.handle === reservedAdminHandle && !verifiedAdmin)
+      throw new AuthError(409, "handle_unavailable");
     const [created] = await tx
       .insert(users)
       .values({
         handle: input.data.handle,
+        role: verifiedAdmin ? "admin" : "user",
         displayName: identity.displayName.slice(0, 80),
       })
       .returning();
@@ -190,6 +223,7 @@ router.post("/profile", async (req, res) => {
       .update(authIdentities)
       .set({ userId: created.id })
       .where(eq(authIdentities.id, identity.id));
+    await publishWaitlistChange(tx);
     return { ...created, avatarUrl: identity.picture };
   });
   res.status(201).json({
@@ -201,14 +235,15 @@ router.post("/profile", async (req, res) => {
     },
   });
 });
-router.post("/logout", async (req, res) => {
-  requireOrigin(req);
+router.post(["/logout", "/admin/logout"], async (req, res) => {
+  const origin = req.path.startsWith("/admin/") ? adminOrigin() : env.APP_ORIGIN;
+  if (req.headers.origin !== origin) throw new AuthError(403, "invalid_origin");
   // DELETE waits for an in-flight refresh and returns its newest token.
   const [session] = await db
     .delete(authSessions)
     .where(eq(authSessions.tokenHash, hash(cookie(req, "session"))))
     .returning();
-  res.clearCookie("session", cookieOptions);
+  res.clearCookie("session", cookieOptions(origin));
   if (session) {
     try {
       await providerPost(

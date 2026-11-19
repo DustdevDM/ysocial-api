@@ -100,7 +100,7 @@ test("topics: tagging, feeds, trending and suggestions", async () => {
     const { env } = await import("../src/config.ts");
     const { hash } = await import("../src/auth/secrets.ts");
     const { rows: [user] } = await pool.query(
-      "INSERT INTO users (handle) VALUES ('topic_author') RETURNING id",
+      "INSERT INTO users (handle, approved_at) VALUES ('topic_author', now()) RETURNING id",
     );
     const { rows: [identity] } = await pool.query(
       "INSERT INTO auth_identities (issuer, subject, user_id) VALUES ('https://test.invalid', 'topic-author', $1) RETURNING id",

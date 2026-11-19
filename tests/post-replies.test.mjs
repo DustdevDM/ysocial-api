@@ -35,7 +35,7 @@ test("post and reply flows", async (t) => {
     const { env } = await import("../src/config.ts");
     const { hash } = await import("../src/auth/secrets.ts");
     const { rows: [user] } = await pool.query(
-      "INSERT INTO users (handle) VALUES ('reply_author') RETURNING id",
+      "INSERT INTO users (handle, approved_at) VALUES ('reply_author', now()) RETURNING id",
     );
     const { rows: [identity] } = await pool.query(
       "INSERT INTO auth_identities (issuer, subject, user_id) VALUES ('https://test.invalid', 'reply-author', $1) RETURNING id",
@@ -295,7 +295,7 @@ test("post and reply flows", async (t) => {
         return (await response.json()).poll;
       }
       const { rows: [voter] } = await pool.query(
-        "INSERT INTO users (handle) VALUES ('other_voter') RETURNING id",
+        "INSERT INTO users (handle, approved_at) VALUES ('other_voter', now()) RETURNING id",
       );
       const { rows: [otherIdentity] } = await pool.query(
         "INSERT INTO auth_identities (issuer, subject, user_id) VALUES ('https://test.invalid', 'other-voter', $1) RETURNING id",

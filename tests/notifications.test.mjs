@@ -39,7 +39,7 @@ test("notifications flow from actions to a private inbox and durable push delive
       const {
         rows: [user],
       } = await pool.query(
-        "INSERT INTO users (handle, display_name) VALUES ($1, $1) RETURNING id, handle",
+        "INSERT INTO users (handle, display_name, approved_at) VALUES ($1, $1, now()) RETURNING id, handle",
         [handle],
       );
       const {

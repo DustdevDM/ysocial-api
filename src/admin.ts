@@ -1,0 +1,498 @@
+import { Router } from "express";
+import { and, asc, count, desc, eq, gte, inArray, isNull, isNotNull, sql } from "drizzle-orm";
+import { z } from "zod";
+import { AuthError } from "./auth/provider.ts";
+import { requireApprovedUser, requireOrigin } from "./auth/request.ts";
+import { db } from "./db/index.ts";
+import { authIdentities, moderationActivity, pollVotes, posts, userRole, users } from "./db/schema.ts";
+import { publicProfileSelection, userSelection } from "./user-data.ts";
+import { clearProfileMedia, flushMediaDeletions, queueDeletion } from "./storage/media-lifecycle.ts";
+import { affectedPostIds, publishAccountChange, publishLiveChange, publishWaitlistChange } from "./live-events.ts";
+import { serveLiveStream } from "./live.ts";
+import { removePost } from "./post-removal.ts";
+import { publishUserPostVisibility, removeUser } from "./user-removal.ts";
+
+import { env, reservedAdminHandle } from "./config.ts";
+import type { Request } from "express";
+
+const router = Router();
+router.use((_req, res, next) => {
+  res.set("Cache-Control", "no-store");
+  next();
+});
+
+async function requireStaff(req: Request) {
+  const user = await requireApprovedUser(req);
+  if (user.role !== "admin" && user.role !== "moderator")
+    throw new AuthError(403, "staff_required");
+  return user;
+}
+
+router.get("/session", async (req, res) => {
+  await requireStaff(req);
+  res.sendStatus(204);
+});
+
+const userFields = {
+  id: users.id,
+  name: users.displayName,
+  handle: users.handle,
+  joined: users.createdAt,
+  role: users.role,
+  bannedAt: users.bannedAt,
+  banReason: users.banReason,
+};
+const canModerateAccount = (viewer: { id: string; role: string }, target: { id: string; handle: string }) =>
+  viewer.role === "admin" && viewer.id !== target.id && target.handle !== reservedAdminHandle;
+const postFields = {
+  id: posts.id,
+  authorId: users.id,
+  author: users.handle,
+  content: posts.content,
+  gif: posts.gif,
+  voiceUrl: sql<string | null>`${posts.voice}->>'url'`,
+  hasPoll: sql<boolean>`${posts.poll} is not null`,
+  kind: sql<"Post" | "Reply">`case when ${posts.parentId} is null then 'Post' else 'Reply' end`,
+  time: posts.createdAt,
+};
+const formatUser = <User extends { handle: string }>(user: User) => ({ ...user, handle: `@${user.handle}` });
+const userSearch = (term: string) =>
+  term ? sql`strpos(lower(${users.handle} || ' ' || ${users.displayName}), ${term}) > 0` : undefined;
+
+const formatPost = <Post extends { author: string }>(post: Post) => ({ ...post, author: `@${post.author}` });
+
+router.get("/overview", async (req, res) => {
+  await requireStaff(req);
+  const query = z.string().trim().max(255).default("").safeParse(req.query.q);
+  if (!query.success) throw new AuthError(400, "invalid_search");
+  const term = query.data.toLowerCase();
+  const since = new Date(Date.now() - 86_400_000);
+  const [recentUsers, recentPosts, [userCounts], [postCounts]] = await Promise.all([
+    db.select({ ...userFields, avatarUrl: userSelection.avatarUrl }).from(users)
+      .where(userSearch(term))
+      .orderBy(desc(users.createdAt), desc(users.id)).limit(50),
+    db.select(postFields).from(posts).innerJoin(users, eq(posts.authorId, users.id))
+      .where(term ? sql`strpos(lower(${users.handle} || ' ' || ${posts.content}), ${term}) > 0` : undefined)
+      .orderBy(desc(posts.createdAt), desc(posts.id)).limit(50),
+    db.select({
+      total: count(),
+      today: sql<number>`count(*) filter (where ${users.createdAt} >= ${since.toISOString()})`.mapWith(Number),
+    }).from(users),
+    db.select({
+      total: count(),
+      today: sql<number>`count(*) filter (where ${posts.createdAt} >= ${since.toISOString()})`.mapWith(Number),
+    }).from(posts),
+  ]);
+  res.json({
+    recentUsers: recentUsers.map(formatUser),
+    recentPosts: recentPosts.map(formatPost),
+    metrics: [
+      { label: "Users", value: String(userCounts.total), detail: `${userCounts.today} in the last 24 hours` },
+      { label: "Posts and replies", value: String(postCounts.total), detail: `${postCounts.today} in the last 24 hours` },
+    ],
+  });
+});
+
+router.get("/user/:id", async (req, res) => {
+  const viewer = await requireStaff(req);
+  const { id } = req.params;
+  if (!z.uuid().safeParse(id).success) throw new AuthError(404, "user_not_found");
+  const [user] = await db.select({
+    ...userFields,
+    ...publicProfileSelection,
+    avatarUrl: userSelection.avatarUrl,
+    colour: users.colour,
+    updatedAt: users.updatedAt,
+  }).from(users).where(eq(users.id, id));
+  if (!user) throw new AuthError(404, "user_not_found");
+  res.json({ ...formatUser(user), kind: "user", canEditProfile: viewer.role === "admin", canModerateAccount: canModerateAccount(viewer, user) });
+});
+
+router.get("/post/:id", async (req, res) => {
+  const viewer = await requireStaff(req);
+  const { id } = req.params;
+  if (!z.uuid().safeParse(id).success) throw new AuthError(404, "post_not_found");
+  const [post] = await db.select({
+    ...postFields,
+    parentId: posts.parentId,
+    quotedPostId: posts.quotedPostId,
+    pollTitle: sql<string | null>`${posts.poll}->>'title'`,
+  }).from(posts)
+    .innerJoin(users, eq(posts.authorId, users.id)).where(eq(posts.id, id));
+  if (!post) throw new AuthError(404, "post_not_found");
+  res.json({ ...formatPost(post), kind: "post", type: post.kind, canRemove: viewer.role === "admin" });
+});
+
+const userListQuery = z.object({
+  q: z.string().trim().max(255).default(""),
+  page: z.coerce.number().int().min(1).max(1_000_000).default(1),
+});
+const pageSize = 25;
+
+router.get("/waitlist", async (req, res) => {
+  const viewer = await requireStaff(req);
+  const input = userListQuery.safeParse(req.query);
+  if (!input.success) throw new AuthError(400, "invalid_waitlist_query");
+  const { q, page } = input.data;
+  const rows = await db.select({ ...userFields, avatarUrl: userSelection.avatarUrl }).from(users)
+    .where(and(isNull(users.approvedAt), isNull(users.bannedAt), userSearch(q.replace(/^@/, "").toLowerCase())))
+    .orderBy(asc(users.createdAt), asc(users.id))
+    .limit(pageSize + 1).offset((page - 1) * pageSize);
+  res.json({ users: rows.slice(0, pageSize).map(formatUser), hasNextPage: rows.length > pageSize, canApprove: viewer.role === "admin" });
+});
+router.get("/waitlist/live", async (req, res) => {
+  await requireStaff(req);
+  serveLiveStream(req, res, "waitlist");
+});
+
+router.get("/activity", async (req, res) => {
+  await requireStaff(req);
+  const input = userListQuery.pick({ page: true }).safeParse(req.query);
+  if (!input.success) throw new AuthError(400, "invalid_activity_query");
+  const rows = await db.select().from(moderationActivity)
+    .orderBy(desc(moderationActivity.createdAt), desc(moderationActivity.id))
+    .limit(pageSize + 1).offset((input.data.page - 1) * pageSize);
+  res.json({ entries: rows.slice(0, pageSize), hasNextPage: rows.length > pageSize });
+});
+
+const contentQuery = userListQuery.extend({
+  type: z.enum(["all", "post", "reply"]).default("all"),
+  author: z.string().trim().toLowerCase().regex(/^(?:@?[a-z0-9_]{3,32})?$/).default(""),
+  authorId: z.uuid().optional(),
+  period: z.enum(["all", "1d", "7d", "30d"]).default("all"),
+  sort: z.enum(["newest", "oldest", "author_asc", "author_desc"]).default("newest"),
+});
+const contentOrder = {
+  newest: [desc(posts.createdAt), desc(posts.id)],
+  oldest: [asc(posts.createdAt), asc(posts.id)],
+  author_asc: [asc(users.handle), desc(posts.createdAt), desc(posts.id)],
+  author_desc: [desc(users.handle), desc(posts.createdAt), desc(posts.id)],
+};
+const contentPeriodDays = { "1d": 1, "7d": 7, "30d": 30 };
+
+router.get("/posts", async (req, res) => {
+  const viewer = await requireStaff(req);
+  const input = contentQuery.safeParse(req.query);
+  if (!input.success) throw new AuthError(400, "invalid_post_query");
+  const { q, page, type, author, authorId, period, sort } = input.data;
+  const term = q.replace(/^@/, "").toLowerCase();
+  const since = period === "all" ? undefined : new Date(Date.now() - contentPeriodDays[period] * 86_400_000);
+  const rows = await db.select(postFields).from(posts).innerJoin(users, eq(posts.authorId, users.id))
+    .where(and(
+      term ? sql`strpos(lower(${users.handle} || ' ' || ${posts.content}), ${term}) > 0` : undefined,
+      type === "post" ? isNull(posts.parentId) : type === "reply" ? isNotNull(posts.parentId) : undefined,
+      author ? eq(users.handle, author.replace(/^@/, "")) : undefined,
+      authorId ? eq(posts.authorId, authorId) : undefined,
+      since ? gte(posts.createdAt, since) : undefined,
+    ))
+    .orderBy(...contentOrder[sort])
+    .limit(pageSize + 1).offset((page - 1) * pageSize);
+  res.json({ posts: rows.slice(0, pageSize).map(formatPost), hasNextPage: rows.length > pageSize, canModerate: viewer.role === "admin" });
+});
+
+router.get("/users", async (req, res) => {
+  const viewer = await requireStaff(req);
+  const query = userListQuery.safeParse(req.query);
+  if (!query.success) throw new AuthError(400, "invalid_user_query");
+  const { q, page } = query.data;
+  const rows = await db.select({
+    ...userFields,
+    avatarUrl: userSelection.avatarUrl,
+    bio: users.bio,
+  }).from(users)
+    .where(userSearch(q.replace(/^@/, "").toLowerCase()))
+    .orderBy(desc(users.createdAt), desc(users.id))
+    .limit(pageSize + 1).offset((page - 1) * pageSize);
+  res.json({
+    users: rows.slice(0, pageSize).map((user) => ({
+      ...formatUser(user),
+      canEditRole: canModerateAccount(viewer, user),
+      canModerateAccount: canModerateAccount(viewer, user),
+    })),
+    hasNextPage: rows.length > pageSize,
+    canEditProfiles: viewer.role === "admin",
+  });
+});
+
+async function requireAdminWrite(req: Request) {
+  const viewer = await requireStaff(req);
+  if (!env.ADMIN_ORIGIN) throw new AuthError(503, "admin_login_not_configured");
+  requireOrigin(req, env.ADMIN_ORIGIN);
+  if (viewer.role !== "admin") throw new AuthError(403, "admin_required");
+  return viewer;
+}
+
+const accountAction = z.discriminatedUnion("action", [
+  z.strictObject({ action: z.literal("ban"), reason: z.string().trim().min(1).max(280).refine((value) => !value.includes("\u0000")) }),
+  z.strictObject({ action: z.literal("unban") }),
+  z.strictObject({ action: z.literal("remove") }),
+]);
+
+router.patch("/users/:id/account", async (req, res) => {
+  const viewer = await requireAdminWrite(req);
+  const id = z.uuid().safeParse(req.params.id);
+  if (!id.success) throw new AuthError(404, "user_not_found");
+  const input = accountAction.safeParse(req.body);
+  if (!input.success) throw new AuthError(400, "invalid_account_action");
+  const { action } = input.data;
+  const targetId = id.data.toLowerCase();
+  if (targetId === viewer.id) throw new AuthError(409, "protected_account");
+  await db.transaction(async (tx) => {
+    // OAuth locks the provider identity before it locks the user profile.
+    if (action === "remove") {
+      await tx.select({ id: authIdentities.id }).from(authIdentities)
+        .where(eq(authIdentities.userId, targetId)).for("update");
+    }
+    const locked = await tx.select({
+      ...userFields, approvedAt: users.approvedAt,
+      avatarKey: users.avatarKey, bannerKey: users.bannerKey,
+    }).from(users).where(inArray(users.id, [viewer.id, targetId])).orderBy(users.id).for("update");
+    const actor = locked.find((user) => user.id === viewer.id);
+    if (actor?.role !== "admin" || actor.bannedAt) throw new AuthError(403, "admin_required");
+    const target = locked.find((user) => user.id === targetId);
+    if (!target) {
+      if (action === "remove") return;
+      throw new AuthError(404, "user_not_found");
+    }
+    if (!canModerateAccount(actor, target)) throw new AuthError(409, "protected_account");
+    if (action === "remove") {
+      await removeUser(tx, target);
+    } else if (input.data.action === "ban" && !target.bannedAt) {
+      await tx.update(users).set({
+        bannedAt: new Date(), banReason: input.data.reason,
+      }).where(eq(users.id, target.id));
+    } else if (action === "unban" && target.bannedAt) {
+      await tx.update(users).set({ bannedAt: null, banReason: null }).where(eq(users.id, target.id));
+    } else {
+      return;
+    }
+    await tx.insert(moderationActivity).values({
+      actorId: actor.id, actorHandle: actor.handle, targetId: target.id, targetHandle: target.handle,
+      action: action === "ban" ? "banUser" : action === "unban" ? "unbanUser" : "removeUser",
+      detail: input.data.action === "ban" ? input.data.reason : null,
+    });
+    await publishAccountChange(tx, target.id);
+    if (action !== "remove") await publishUserPostVisibility(tx, target.id);
+    if (!target.approvedAt) await publishWaitlistChange(tx);
+  });
+  res.sendStatus(204);
+});
+
+router.post("/waitlist/:id/approve", async (req, res) => {
+  const viewer = await requireAdminWrite(req);
+  const id = z.uuid().safeParse(req.params.id);
+  if (!id.success) throw new AuthError(404, "user_not_found");
+  const targetId = id.data.toLowerCase();
+  await db.transaction(async (tx) => {
+    const locked = await tx.select({
+      id: users.id, role: users.role, handle: users.handle, approvedAt: users.approvedAt, bannedAt: users.bannedAt,
+    }).from(users).where(inArray(users.id, [viewer.id, targetId])).orderBy(users.id).for("update");
+    const actor = locked.find((user) => user.id === viewer.id);
+    if (actor?.role !== "admin" || actor.bannedAt) throw new AuthError(403, "admin_required");
+    const target = locked.find((user) => user.id === targetId);
+    if (!target) throw new AuthError(404, "user_not_found");
+    if (target.bannedAt) throw new AuthError(409, "account_banned");
+    if (target.approvedAt) return;
+    const approvedAt = new Date();
+    await tx.update(users).set({ approvedAt }).where(eq(users.id, target.id));
+    await tx.insert(moderationActivity).values({
+      actorId: actor.id, actorHandle: actor.handle, targetId: target.id, targetHandle: target.handle, action: "approveUser",
+    });
+    await publishWaitlistChange(tx, target.id);
+  });
+  res.sendStatus(204);
+});
+
+router.delete("/posts/:id", async (req, res) => {
+  const viewer = await requireAdminWrite(req);
+  const id = z.uuid().safeParse(req.params.id);
+  if (!id.success) throw new AuthError(404, "post_not_found");
+  const removed = await db.transaction(async (tx) => {
+    const [actor] = await tx.select({ role: users.role, handle: users.handle, bannedAt: users.bannedAt }).from(users)
+      .where(eq(users.id, viewer.id)).for("share");
+    if (actor?.role !== "admin" || actor.bannedAt) throw new AuthError(403, "admin_required");
+    const deleted = await removePost(tx, id.data);
+    if (!deleted) throw new AuthError(404, "post_not_found");
+    const [author] = await tx.select({ handle: users.handle }).from(users)
+      .where(eq(users.id, deleted.authorId));
+    await tx.insert(moderationActivity).values({
+      actorId: viewer.id, actorHandle: actor.handle,
+      targetId: id.data, targetHandle: author?.handle ?? "",
+      action: "removePost",
+    });
+    return deleted;
+  });
+  if (removed.voice) await flushMediaDeletions(removed.voice.key);
+  res.sendStatus(204);
+});
+
+router.delete("/posts/:id/attachments/:kind", async (req, res) => {
+  const viewer = await requireAdminWrite(req);
+  const id = z.uuid().safeParse(req.params.id);
+  const kind = z.enum(["gif", "voice", "all"]).safeParse(req.params.kind);
+  if (!id.success || !kind.success) throw new AuthError(404, "attachment_not_found");
+  const attachmentKind = kind.data;
+
+  const voiceKey = await db.transaction(async (tx) => {
+    const [actor] = await tx.select({ role: users.role, handle: users.handle, bannedAt: users.bannedAt }).from(users)
+      .where(eq(users.id, viewer.id)).for("share");
+    if (actor?.role !== "admin" || actor.bannedAt) throw new AuthError(403, "admin_required");
+    const [post] = await tx.select({
+      authorId: posts.authorId,
+      gif: posts.gif,
+      voice: posts.voice,
+      hasPoll: sql<boolean>`${posts.poll} is not null`,
+      hasText: sql<boolean>`${posts.content} ~ '[^[:space:]]'`,
+    }).from(posts).where(eq(posts.id, id.data)).for("update");
+    if (!post) throw new AuthError(404, "post_not_found");
+    const clearAll = attachmentKind === "all";
+    const hasAttachment = clearAll ? post.gif || post.voice || post.hasPoll : post[attachmentKind];
+    if (!hasAttachment) return;
+    const gif = attachmentKind === "gif";
+    const keepsAttachment = !clearAll && (post.hasPoll || (gif ? post.voice : post.gif));
+    if (!post.hasText && !keepsAttachment)
+      throw new AuthError(409, "attachment_required");
+
+    const fields = clearAll ? { gif: null, voice: null, poll: null } : gif ? { gif: null } : { voice: null };
+    await tx.update(posts).set(fields).where(eq(posts.id, id.data));
+    if (clearAll && post.hasPoll) await tx.delete(pollVotes).where(eq(pollVotes.postId, id.data));
+    const key = gif ? undefined : post.voice?.key;
+    if (key) await queueDeletion(tx, key);
+    const [author] = await tx.select({ handle: users.handle }).from(users).where(eq(users.id, post.authorId));
+    await tx.insert(moderationActivity).values({
+      actorId: viewer.id, actorHandle: actor.handle, targetId: id.data,
+      targetHandle: author?.handle ?? "", action: clearAll ? "clearAttachments" : gif ? "removeGif" : "removeVoice",
+    });
+    await publishLiveChange(tx, await affectedPostIds(tx, id.data));
+    return key;
+  });
+  if (voiceKey) await flushMediaDeletions(voiceKey);
+  res.sendStatus(204);
+});
+
+const nameChange = z.strictObject({ action: z.literal("changeName"), value: z.string().trim().min(1).max(80) });
+const bioChange = z.strictObject({ action: z.literal("changeBio"), value: z.string().trim().min(1).max(160) });
+const profileChange = z.discriminatedUnion("action", [
+  z.strictObject({ action: z.literal("clearBio") }),
+  z.strictObject({ action: z.literal("clearAvatar") }),
+  z.strictObject({ action: z.literal("clearBanner") }),
+  z.strictObject({ action: z.literal("changeUsername"), value: z.string().regex(/^[a-z0-9_]{3,32}$/) }),
+  nameChange,
+  bioChange,
+]);
+
+router.patch("/users/:id/profile", async (req, res) => {
+  const viewer = await requireAdminWrite(req);
+  const id = z.uuid().safeParse(req.params.id);
+  if (!id.success) throw new AuthError(404, "user_not_found");
+  const input = profileChange.safeParse(req.body);
+  if (!input.success) throw new AuthError(400, "invalid_profile_change");
+  const change = input.data;
+  const targetId = id.data.toLowerCase();
+
+  const updated = await db.transaction(async (tx) => {
+    const locked = await tx.select({
+      id: users.id, handle: users.handle, role: users.role, bannedAt: users.bannedAt,
+      avatarKey: users.avatarKey, bannerKey: users.bannerKey,
+    }).from(users).where(inArray(users.id, [viewer.id, targetId])).orderBy(users.id).for("update");
+    const actor = locked.find((user) => user.id === viewer.id);
+    if (actor?.role !== "admin" || actor.bannedAt)
+      throw new AuthError(403, "admin_required");
+    const target = locked.find((user) => user.id === targetId);
+    if (!target) throw new AuthError(404, "user_not_found");
+    if (change.action === "clearAvatar" || change.action === "clearBanner") {
+      await clearProfileMedia(tx, target, change.action === "clearAvatar" ? "avatar" : "banner");
+    } else {
+      if (change.action === "changeUsername" && (target.handle === reservedAdminHandle || change.value === reservedAdminHandle))
+        throw new AuthError(409, "reserved_username");
+      const fields = change.action === "changeUsername" ? { handle: change.value }
+        : change.action === "changeName" ? { displayName: change.value }
+        : { bio: change.action === "changeBio" ? change.value : "" };
+      await tx.update(users).set({ ...fields, updatedAt: new Date() }).where(eq(users.id, target.id));
+    }
+    const [user] = await tx.select({
+      ...userFields, avatarUrl: userSelection.avatarUrl, bio: users.bio,
+    }).from(users).where(eq(users.id, target.id));
+    await tx.insert(moderationActivity).values({
+      actorId: actor.id, actorHandle: actor.handle, targetId: target.id, targetHandle: target.handle,
+      action: change.action, detail: change.action === "changeUsername" ? `@${target.handle} → @${user.handle}` : null,
+    });
+    return formatUser(user);
+  });
+  res.json({
+    ...updated,
+    canEditRole: viewer.id !== updated.id && updated.handle.slice(1) !== reservedAdminHandle,
+    canModerateAccount: viewer.id !== updated.id && updated.handle.slice(1) !== reservedAdminHandle,
+  });
+});
+
+const userIds = z.array(z.uuid()).min(1).max(pageSize);
+const bulkProfileChange = z.discriminatedUnion("action", [
+  nameChange.extend({ ids: userIds }),
+  bioChange.extend({ ids: userIds }),
+]);
+
+router.patch("/users/profiles", async (req, res) => {
+  const viewer = await requireAdminWrite(req);
+  const input = bulkProfileChange.safeParse(req.body);
+  if (!input.success) throw new AuthError(400, "invalid_profile_change");
+  const { action, value } = input.data;
+  const ids = new Set(input.data.ids.map((id) => id.toLowerCase()));
+
+  const updated = await db.transaction(async (tx) => {
+    const locked = await tx.select({
+      ...userFields, bio: users.bio,
+    }).from(users).where(inArray(users.id, [...new Set([viewer.id, ...ids])]))
+      .orderBy(users.id).for("update");
+    const actor = locked.find((user) => user.id === viewer.id);
+    if (actor?.role !== "admin" || actor.bannedAt) throw new AuthError(403, "admin_required");
+    const targets = locked.filter((user) => ids.has(user.id));
+    if (targets.length !== ids.size) throw new AuthError(404, "user_not_found");
+    const changed = targets.filter((user) => (action === "changeName" ? user.name : user.bio) !== value);
+    if (!changed.length) return [];
+    const fields = action === "changeName" ? { displayName: value } : { bio: value };
+    const saved = await tx.update(users).set({ ...fields, updatedAt: new Date() })
+      .where(inArray(users.id, changed.map((user) => user.id)))
+      .returning({ id: users.id, name: users.displayName, bio: users.bio });
+    await tx.insert(moderationActivity).values(changed.map((user) => ({
+      actorId: actor.id, actorHandle: actor.handle, targetId: user.id, targetHandle: user.handle, action,
+    })));
+    return saved;
+  });
+  res.json({ users: updated });
+});
+
+const roleUpdate = z.strictObject({
+  ids: userIds,
+  role: z.enum(userRole.enumValues),
+});
+
+router.patch("/users/roles", async (req, res) => {
+  const viewer = await requireAdminWrite(req);
+  const input = roleUpdate.safeParse(req.body);
+  if (!input.success) throw new AuthError(400, "invalid_role_update");
+  const ids = [...new Set(input.data.ids.map((id) => id.toLowerCase()))];
+  if (ids.includes(viewer.id)) throw new AuthError(409, "own_role_protected");
+
+  const updated = await db.transaction(async (tx) => {
+    // Lock the acting admin and all targets in ID order so role changes serialize.
+    const locked = await tx.select(userFields).from(users)
+      .where(inArray(users.id, [viewer.id, ...ids])).orderBy(users.id).for("update");
+    const actor = locked.find((user) => user.id === viewer.id);
+    if (actor?.role !== "admin" || actor.bannedAt) throw new AuthError(403, "admin_required");
+    const targets = locked.filter((user) => user.id !== viewer.id);
+    if (targets.length !== ids.length) throw new AuthError(404, "user_not_found");
+    if (targets.some((user) => user.handle === reservedAdminHandle))
+      throw new AuthError(409, "reserved_role_protected");
+    const changed = targets.filter((user) => user.role !== input.data.role);
+    if (changed.length) await tx.insert(moderationActivity).values(changed.map((user) => ({
+      actorId: actor.id, actorHandle: actor.handle, targetId: user.id, targetHandle: user.handle,
+      action: "changeRole", detail: `${user.role} → ${input.data.role}`,
+    })));
+    return tx.update(users).set({ role: input.data.role })
+      .where(inArray(users.id, ids)).returning({ id: users.id, role: users.role });
+  });
+  res.json({ users: updated });
+});
+
+export default router;

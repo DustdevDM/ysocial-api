@@ -16,6 +16,7 @@ import { env } from "./config.ts";
 import { endpointSchema, subscriptionSchema } from "./push-config.ts";
 import { userSelection } from "./user-data.ts";
 import { notificationPreview } from "./notification-content.ts";
+import { visiblePostAuthor } from "./post-data.ts";
 
 const router = Router();
 router.use((_req, res, next) => {
@@ -59,7 +60,7 @@ router.get("/", async (req, res) => {
     })
     .from(notifications)
     .innerJoin(users, eq(users.id, notifications.actorId))
-    .leftJoin(posts, eq(posts.id, notifications.postId))
+    .leftJoin(posts, and(eq(posts.id, notifications.postId), visiblePostAuthor))
     .where(
       and(
         eq(notifications.recipientId, userId),

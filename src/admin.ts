@@ -11,6 +11,8 @@ import { affectedPostIds, publishAccountChange, publishLiveChange, publishWaitli
 import { serveLiveStream } from "./live.ts";
 import { removePost } from "./post-removal.ts";
 import { publishUserPostVisibility, removeUser } from "./user-removal.ts";
+import { badgeDetails, badgeIcons, badgePresets } from "./profile-badges.ts";
+import { randomUUID } from "node:crypto";
 
 import { env } from "./config.ts";
 import type { Request } from "express";
@@ -39,6 +41,7 @@ const userFields = {
   handle: users.handle,
   joined: users.createdAt,
   role: users.role,
+  badges: users.badges,
   bannedAt: users.bannedAt,
   banReason: users.banReason,
 };
@@ -105,7 +108,12 @@ router.get("/user/:id", async (req, res) => {
     updatedAt: users.updatedAt,
   }).from(users).where(eq(users.id, id));
   if (!user) throw new AuthError(404, "user_not_found");
-  res.json({ ...formatUser(user), kind: "user", canEditProfile: viewer.role === "admin", canModerateAccount: canModerateAccount(viewer, user) });
+  res.json({
+    ...formatUser(user), kind: "user",
+    canEditProfile: viewer.role === "admin",
+    canEditBadges: viewer.role === "admin",
+    canModerateAccount: canModerateAccount(viewer, user),
+  });
 });
 
 router.get("/post/:id", async (req, res) => {
@@ -211,6 +219,7 @@ router.get("/users", async (req, res) => {
     })),
     hasNextPage: rows.length > pageSize,
     canEditProfiles: viewer.role === "admin",
+    canEditBadges: viewer.role === "admin",
   });
 });
 
@@ -489,6 +498,61 @@ router.patch("/users/roles", async (req, res) => {
       .where(inArray(users.id, ids)).returning({ id: users.id, role: users.role });
   });
   res.json({ users: updated });
+});
+
+router.get("/badge-options", async (req, res) => {
+  const viewer = await requireStaff(req);
+  if (viewer.role !== "admin") throw new AuthError(403, "admin_required");
+  res.json({ icons: badgeIcons, presets: badgePresets });
+});
+
+const badgeChange = z.discriminatedUnion("action", [
+  badgeDetails.extend({ action: z.literal("add") }),
+  z.strictObject({ action: z.literal("remove"), id: z.uuid() }),
+]);
+const maxProfileBadges = 10;
+
+router.patch("/users/:id/badges", async (req, res) => {
+  const viewer = await requireAdminWrite(req);
+  const targetId = z.uuid().safeParse(req.params.id);
+  if (!targetId.success) throw new AuthError(404, "user_not_found");
+  const input = badgeChange.safeParse(req.body);
+  if (!input.success) throw new AuthError(400, "invalid_badge");
+  const change = input.data;
+  const id = targetId.data.toLowerCase();
+
+  const badges = await db.transaction(async (tx) => {
+    const locked = await tx.select(userFields).from(users)
+      .where(inArray(users.id, [viewer.id, id])).orderBy(users.id).for("update");
+    const actor = locked.find((user) => user.id === viewer.id);
+    if (actor?.role !== "admin" || actor.bannedAt) throw new AuthError(403, "admin_required");
+    const target = locked.find((user) => user.id === id);
+    if (!target) throw new AuthError(404, "user_not_found");
+
+    if (change.action === "add") {
+      const { icon, tooltip } = change;
+      if (target.badges.some((badge) => badge.icon === icon && badge.tooltip === tooltip)) return target.badges;
+      if (target.badges.length >= maxProfileBadges) throw new AuthError(400, "badge_limit_reached");
+      const updated = [...target.badges, { id: randomUUID(), icon, tooltip }];
+      await tx.update(users).set({ badges: updated }).where(eq(users.id, id));
+      await tx.insert(moderationActivity).values({
+        actorId: actor.id, actorHandle: actor.handle, targetId: id, targetHandle: target.handle,
+        action: "addBadge", detail: `${icon}: ${tooltip}`,
+      });
+      return updated;
+    }
+
+    const removed = target.badges.find((badge) => badge.id === change.id);
+    if (!removed) return target.badges;
+    const updated = target.badges.filter((badge) => badge.id !== removed.id);
+    await tx.update(users).set({ badges: updated }).where(eq(users.id, id));
+    await tx.insert(moderationActivity).values({
+      actorId: actor.id, actorHandle: actor.handle, targetId: id, targetHandle: target.handle,
+      action: "removeBadge", detail: `${removed.icon}: ${removed.tooltip}`,
+    });
+    return updated;
+  });
+  res.json({ badges });
 });
 
 export default router;

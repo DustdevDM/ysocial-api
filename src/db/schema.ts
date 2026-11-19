@@ -1,6 +1,7 @@
 import type { BannerCrop } from "../storage/banner-crop.ts";
 import type { KlipyGif } from "../storage/klipy.ts";
 import type { PollDefinition } from "../poll-schema.ts";
+import type { ProfileBadge } from "../profile-badges.ts";
 import type { Voice } from "../storage/voice-selection.ts";
 import { sql } from "drizzle-orm";
 import {
@@ -39,6 +40,7 @@ export const users = pgTable(
   {
     id: uuid().defaultRandom().primaryKey(),
     role: userRole().notNull().default("user"),
+    badges: jsonb().$type<ProfileBadge[]>().notNull().default([]),
     approvedAt: timestamp("approved_at", { withTimezone: true, precision: 3 }),
     bannedAt: timestamp("banned_at", { withTimezone: true, precision: 3 }),
     banReason: text("ban_reason"),

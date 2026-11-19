@@ -1,5 +1,5 @@
 {
-  "id": "beabb2c1-1ba5-4143-aec8-2f79583e475c",
+  "id": "7284e4d7-20a0-41ba-a51b-5610e9d8ca45",
   "prevId": "ec326eff-1c26-4573-8a7b-d3775e86b985",
   "version": "7",
   "dialect": "postgresql",
@@ -1281,6 +1281,21 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "posts_content_search_idx": {
+          "name": "posts_content_search_idx",
+          "columns": [
+            {
+              "expression": "to_tsvector('simple', \"content\")",
+              "asc": true,
+              "isExpression": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "gin",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -1752,13 +1767,6 @@
         },
         "bio": {
           "name": "bio",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "''"
-        },
-        "pronouns": {
-          "name": "pronouns",
           "type": "text",
           "primaryKey": false,
           "notNull": true,

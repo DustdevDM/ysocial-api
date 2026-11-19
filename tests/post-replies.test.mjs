@@ -118,6 +118,26 @@ test("post and reply flows", async (t) => {
       await count(unrelated.id, 1);
     });
 
+    await t.test("post content allows at most two consecutive blank lines", async () => {
+      const allowed = "First\r\n \r\n\t\r\nLast";
+      const created = await request("/api/posts", "POST", { content: allowed });
+      assert.equal(created.status, 201);
+      const { post } = await created.json();
+      assert.equal(post.content, allowed);
+
+      const content = "First\n\n \n\t\nLast";
+      const path = `/api/posts/${post.id}`;
+      for (const response of [
+        await request("/api/posts", "POST", { content }),
+        await request("/api/posts", "POST", { content, quotedPostId: post.id }),
+        await request(`${path}/replies`, "POST", { content }),
+        await request(path, "PATCH", { content }),
+      ]) {
+        assert.equal(response.status, 400);
+      }
+      assert.equal((await get(path)).post.content, allowed);
+    });
+
     await t.test("posting, replying, and editing allow more than five links", async () => {
       const content = Array.from({ length: 8 }, (_, index) => `https://example.org/${index}`).join(" ");
       const clientId = randomUUID();

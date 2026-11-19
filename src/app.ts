@@ -12,6 +12,7 @@ import live from "./live.ts";
 import { startLiveEvents } from "./live-events.ts";
 import notifications from "./notifications.ts";
 import topics from "./topics.ts";
+import search from "./search.ts";
 import { startPushDelivery } from "./push-delivery.ts";
 import { AuthError } from "./auth/provider.ts";
 import express, { type ErrorRequestHandler } from "express";
@@ -51,6 +52,7 @@ app.use("/api/og", og);
 app.use("/api/live", live);
 app.use("/api/notifications", notifications);
 app.use("/api/topics", topics);
+app.use("/api/search", search);
 app.use("/api/profiles", profiles);
 app.use("/api/avatars", avatars);
 app.use("/api/banners", banners);
@@ -132,6 +134,7 @@ if (import.meta.main) {
     const schema = await pool.query<{ ready: boolean }>(`SELECT
       to_regclass('public.post_likes') IS NOT NULL AND
       to_regclass('public.post_topics') IS NOT NULL AND
+      to_regclass('public.posts_content_search_idx') IS NOT NULL AND
       to_regclass('public.media_deletions') IS NOT NULL AND
       to_regclass('public.voice_jobs') IS NOT NULL AND
       EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass('public.posts') AND tgname = 'posts_voice_cleanup' AND tgenabled IN ('O', 'A')) AND

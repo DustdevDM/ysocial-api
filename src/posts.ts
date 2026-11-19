@@ -44,6 +44,7 @@ import { AuthError } from "./auth/provider.ts";
 import { userSelection } from "./user-data.ts";
 import { recordNotification } from "./notification-events.ts";
 import { parseTopicName, syncPostTopics } from "./topics.ts";
+import { postFilterConditions, postMatchesSql, readPostFilters, readSearchQuery } from "./search.ts";
 import { extractTopics } from "./topics-text.ts";
 import { affectedPostIds, publishLiveChange, publishLivePost } from "./live-events.ts";
 import { removePost } from "./post-removal.ts";
@@ -63,6 +64,13 @@ const contentSchema = z.strictObject({
     .string()
     .trim()
     .refine((value) => !value.includes("\u0000"))
+    .refine(
+      (value) =>
+        !/(?:^|\n)(?:[^\S\n]*\n){3}/.test(
+          value.replace(/\r\n?|[\u2028\u2029]/g, "\n"),
+        ),
+      "Use at most two blank lines in a row.",
+    )
     .refine((value) => {
       const length = Array.from(value).length;
       return length <= 2000;
@@ -281,6 +289,14 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
     !parentId && req.query.topic !== undefined
       ? parseTopicName(req.query.topic)
       : undefined;
+  const search =
+    !parentId && req.query.q !== undefined
+      ? readSearchQuery(req.query.q)
+      : undefined;
+  const filters = parentId ? undefined : readPostFilters(req.query);
+  const textSearch = search?.usable ? search : undefined;
+  const searching = textSearch !== undefined || filters?.active === true;
+  const oldestFirst = searching && filters?.sort === "oldest";
   let cursor: z.infer<typeof cursorSchema> | undefined;
   if (req.query.cursor !== undefined) {
     try {
@@ -293,7 +309,16 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
       throw new AuthError(400, "invalid_cursor");
     }
   }
-  if (!parentId && !topic) {
+  if (search && !search.usable && !searching) {
+    res.json({
+      repostedBy: {},
+      posts: [],
+      nextCursor: null,
+      serverNow: new Date().toISOString(),
+    });
+    return;
+  }
+  if (!parentId && !topic && !searching) {
     const feed = await homeFeed(viewerId, cursor && { createdAt: cursor.createdAt, id: cursor.id }, 20);
     res.json({ ...feed, serverNow: new Date().toISOString() });
     return;
@@ -306,6 +331,8 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
       and(
         isNull(users.bannedAt),
         parentId ? eq(posts.parentId, parentId) : undefined,
+        textSearch ? postMatchesSql(textSearch) : undefined,
+        ...(filters && searching ? postFilterConditions(filters) : []),
         topic
           ? inArray(
               posts.id,
@@ -317,22 +344,26 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
           : undefined,
         cursor
           ? or(
-              lt(posts.createdAt, new Date(cursor.createdAt)),
+              (oldestFirst ? gt : lt)(posts.createdAt, new Date(cursor.createdAt)),
               and(
                 eq(posts.createdAt, new Date(cursor.createdAt)),
-                lt(posts.id, cursor.id),
+                (oldestFirst ? gt : lt)(posts.id, cursor.id),
               ),
             )
           : undefined,
       ),
     )
-    .orderBy(desc(posts.createdAt), desc(posts.id))
+    .orderBy(
+      ...(oldestFirst
+        ? [asc(posts.createdAt), asc(posts.id)]
+        : [desc(posts.createdAt), desc(posts.id)]),
+    )
     .limit(21);
   const page = rows.slice(0, 20);
   const last = page.at(-1);
   // A topic lists replies next to posts; send the chain above each reply so
   // clients can show it in context instead of as a stray post.
-  const ancestors = topic ? await loadAncestors(page, viewerId) : undefined;
+  const ancestors = topic || searching ? await loadAncestors(page, viewerId) : undefined;
   res.json({
     repostedBy: {},
     posts: (

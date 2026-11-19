@@ -64,6 +64,13 @@ const contentSchema = z.strictObject({
     .string()
     .trim()
     .refine((value) => !value.includes("\u0000"))
+    .refine(
+      (value) =>
+        !/(?:^|\n)(?:[^\S\n]*\n){3}/.test(
+          value.replace(/\r\n?|[\u2028\u2029]/g, "\n"),
+        ),
+      "Use at most two blank lines in a row.",
+    )
     .refine((value) => {
       const length = Array.from(value).length;
       return length <= 2000;

@@ -85,7 +85,7 @@ const cursorSchema = z.strictObject({
   createdAt: z.iso.datetime(),
   id: z.uuid(),
 });
-async function findPost(id: string, viewerId: string | null = null) {
+export async function findPost(id: string, viewerId: string | null = null) {
   const [post] = await db
     .select(postSelection(viewerId))
     .from(posts)

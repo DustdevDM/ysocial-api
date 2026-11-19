@@ -37,6 +37,7 @@ export const banDetailsSelection = {
 
 export const publicProfileSelection = {
   bio: users.bio,
+  pronouns: users.pronouns,
   bannerCrop: users.bannerCrop,
   bannerUrl: sql<string | null>`case when ${users.bannerKey} is null then ${users.bannerExternalUrl} else '/api/' || ${users.bannerKey} end`,
   followerCount: sql<number>`(select count(*)::int from ${userFollows} where ${userFollows.followingId} = ${users.id})`,

@@ -19,12 +19,20 @@ import { postSelection, serializePost } from "./post-data.ts";
 import { banDetailsSelection, publicProfileSelection, userSelection } from "./user-data.ts";
 import { recordNotification } from "./notification-events.ts";
 import { badgeIconDirectory, isBadgeIcon } from "./profile-badges.ts";
+import { generalPronounRecommendations, pronounRecommendations, pronounsLimit, pronounsSchema } from "./pronouns.ts";
 
 const router = Router();
 const handleSchema = z.string().regex(/^[a-z0-9_]{3,32}$/);
 router.use((_req, res, next) => {
   res.set("Cache-Control", "no-store");
   next();
+});
+router.get("/pronouns/recommendations", (_req, res) => {
+  res.json({
+    languages: pronounRecommendations,
+    general: generalPronounRecommendations,
+    maxLength: pronounsLimit,
+  });
 });
 router.get("/badge-icons/:icon", (req, res) => {
   const { icon } = req.params;
@@ -59,6 +67,7 @@ router.patch("/me", async (req, res) => {
       handle: handleSchema,
       displayName: z.string().trim().min(1).max(80),
       bio: z.string().max(160),
+      pronouns: pronounsSchema,
     })
     .partial()
     .refine((changes) => Object.keys(changes).length > 0)
@@ -72,6 +81,7 @@ router.patch("/me", async (req, res) => {
       handle: users.handle,
       displayName: users.displayName,
       bio: users.bio,
+      pronouns: users.pronouns,
     });
   if (!profile) throw new AuthError(404, "profile_not_found");
   res.json(profile);
@@ -94,6 +104,7 @@ router.get("/:handle/card", async (req, res) => {
     .select({
       ...userSelection,
       bio: users.bio,
+      pronouns: users.pronouns,
       bannerCrop: users.bannerCrop,
       bannerUrl: sql<
         string | null

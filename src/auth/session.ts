@@ -89,6 +89,7 @@ export async function readSessionHash(tokenHash: string) {
       ? (await tx
           .select({
             ...userSelection,
+            pronouns: users.pronouns,
             role: users.role,
             approvedAt: users.approvedAt,
             ...banDetailsSelection,

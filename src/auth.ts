@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { Router } from "express";
 import { and, eq, gt, lt } from "drizzle-orm";
 import { z } from "zod";
+import { pronounsSchema } from "./pronouns.ts";
 import { db } from "./db/index.ts";
 import {
   authIdentities,
@@ -176,9 +177,16 @@ router.get("/approval/live", async (req, res) => {
 router.post("/profile", async (req, res) => {
   requireOrigin(req);
   const input = z
-    .strictObject({ handle: z.string().regex(/^[a-z0-9_]{3,32}$/) })
+    .strictObject({
+      handle: z.string().regex(/^[a-z0-9_]{3,32}$/),
+      pronouns: pronounsSchema.optional(),
+    })
     .safeParse(req.body);
-  if (!input.success) throw new AuthError(400, "invalid_handle");
+  if (!input.success) {
+    if (input.error.issues.some((issue) => issue.path[0] === "pronouns"))
+      throw new AuthError(400, "invalid_profile");
+    throw new AuthError(400, "invalid_handle");
+  }
   const session = await readSession(cookie(req, "session"));
   if (session.kind === "anonymous")
     throw new AuthError(401, "sign_in_required");
@@ -208,6 +216,7 @@ router.post("/profile", async (req, res) => {
       .values({
         handle: input.data.handle,
         displayName: identity.displayName.slice(0, 80),
+        pronouns: input.data.pronouns,
       })
       .returning();
     await tx
@@ -222,6 +231,7 @@ router.post("/profile", async (req, res) => {
       id: user.id,
       handle: user.handle,
       displayName: user.displayName,
+      pronouns: user.pronouns,
       avatarUrl: user.avatarUrl,
     },
   });

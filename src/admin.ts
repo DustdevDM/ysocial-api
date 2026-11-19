@@ -12,6 +12,7 @@ import { serveLiveStream } from "./live.ts";
 import { removePost } from "./post-removal.ts";
 import { publishUserPostVisibility, removeUser } from "./user-removal.ts";
 import { badgeDetails, badgeIcons, badgePresets } from "./profile-badges.ts";
+import { pronounsSchema } from "./pronouns.ts";
 import { randomUUID } from "node:crypto";
 
 import { env } from "./config.ts";
@@ -207,6 +208,7 @@ router.get("/users", async (req, res) => {
     ...userFields,
     avatarUrl: userSelection.avatarUrl,
     bio: users.bio,
+    pronouns: users.pronouns,
   }).from(users)
     .where(userSearch(q.replace(/^@/, "").toLowerCase()))
     .orderBy(desc(users.createdAt), desc(users.id))
@@ -388,6 +390,7 @@ const profileChange = z.discriminatedUnion("action", [
   z.strictObject({ action: z.literal("changeUsername"), value: z.string().regex(/^[a-z0-9_]{3,32}$/) }),
   nameChange,
   bioChange,
+  z.strictObject({ action: z.literal("changePronouns"), value: pronounsSchema }),
 ]);
 
 router.patch("/users/:id/profile", async (req, res) => {
@@ -414,11 +417,12 @@ router.patch("/users/:id/profile", async (req, res) => {
     } else {
       const fields = change.action === "changeUsername" ? { handle: change.value }
         : change.action === "changeName" ? { displayName: change.value }
+        : change.action === "changePronouns" ? { pronouns: change.value }
         : { bio: change.action === "changeBio" ? change.value : "" };
       await tx.update(users).set({ ...fields, updatedAt: new Date() }).where(eq(users.id, target.id));
     }
     const [user] = await tx.select({
-      ...userFields, avatarUrl: userSelection.avatarUrl, bio: users.bio,
+      ...userFields, avatarUrl: userSelection.avatarUrl, bio: users.bio, pronouns: users.pronouns,
     }).from(users).where(eq(users.id, target.id));
     await tx.insert(moderationActivity).values({
       actorId: actor.id, actorHandle: actor.handle, targetId: target.id, targetHandle: target.handle,

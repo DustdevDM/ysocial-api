@@ -100,28 +100,31 @@ test("staff sessions can read admin data and role changes take effect on the nex
       );
       return token;
     }
-    const onboard = (token, handle = "ytest") => fetch(base + "/auth/profile", {
+    const onboard = (token, handle = "ytest", pronouns) => fetch(base + "/auth/profile", {
       method: "POST",
       headers: {
         Cookie: `session=${token}`,
         Origin: env.APP_ORIGIN,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ handle }),
+      body: JSON.stringify({ handle, pronouns }),
     });
     const regularToken = await onboardingSession("different");
     const regular = await onboard(regularToken);
     assert.equal(regular.status, 201);
     const { user: regularUser } = await regular.json();
+    assert.equal(regularUser.pronouns, "");
     assert.equal((await fetch(base + "/api/admin/session", {
       headers: { Cookie: `session=${regularToken}` },
     })).status, 403);
     await database.pool.query("DELETE FROM users WHERE id = $1", [regularUser.id]);
 
     const newToken = await onboardingSession("ytest");
-    const joinedYtest = await onboard(newToken);
+    assert.equal((await onboard(newToken, "ytest", "a".repeat(81))).status, 400);
+    const joinedYtest = await onboard(newToken, "ytest", "  hän  ");
     assert.equal(joinedYtest.status, 201);
     const { user: ytest } = await joinedYtest.json();
+    assert.equal(ytest.pronouns, "hän");
     const staffHeaders = { Cookie: `session=${newToken}` };
     assert.equal((await fetch(base + "/api/admin/session", {
       headers: staffHeaders,
@@ -129,6 +132,7 @@ test("staff sessions can read admin data and role changes take effect on the nex
     const ytestSession = await fetch(base + "/auth/me", { headers: staffHeaders }).then(response => response.json());
     assert.equal(ytestSession.pendingApproval, true);
     assert.equal(ytestSession.user.role, "user");
+    assert.equal(ytestSession.user.pronouns, "hän");
     await database.pool.query("UPDATE users SET role = 'admin', approved_at = now() WHERE id = $1", [ytest.id]);
 
     const applicantToken = await onboardingSession("waitlist_test");
@@ -167,6 +171,26 @@ test("staff sessions can read admin data and role changes take effect on the nex
     assert.equal((await approve()).status, 204);
     assert.equal((await approve()).status, 204);
     assert.equal((await applicantSession()).pendingApproval, false);
+    const recommendations = await fetch(base + "/api/profiles/pronouns/recommendations");
+    assert.equal(recommendations.status, 200);
+    const { languages, general } = await recommendations.json();
+    assert.ok(languages.de.includes("er/ihm"));
+    assert.ok(languages.fi.includes("hän"));
+    assert.ok(general.includes("Use my name"));
+    const setPronouns = (pronouns) => fetch(base + "/api/profiles/me", {
+      method: "PATCH",
+      headers: { ...applicantHeaders, Origin: env.APP_ORIGIN, "Content-Type": "application/json" },
+      body: JSON.stringify({ pronouns }),
+    });
+    assert.equal((await setPronouns("they\u0000them")).status, 400);
+    const updatedPronouns = await setPronouns("  ze/zir, 她  ");
+    assert.equal(updatedPronouns.status, 200);
+    assert.equal((await updatedPronouns.json()).pronouns, "ze/zir, 她");
+    for (const path of ["waitlist_test", "waitlist_test/card"]) {
+      const profile = await fetch(base + "/api/profiles/" + path);
+      assert.equal((await profile.json()).profile.pronouns, "ze/zir, 她");
+    }
+    assert.equal((await applicantSession()).user.pronouns, "ze/zir, 她");
     assert.equal((await waitlist()).users.length, 0);
     assert.equal((await like()).status, 200);
     const { rows: [approvalLog] } = await database.pool.query(
@@ -333,6 +357,11 @@ test("staff sessions can read admin data and role changes take effect on the nex
     assert.equal((await editProfile(user.id, "changeBio", "a".repeat(161))).status, 400);
     assert.equal((await editProfile(user.id, "changeBio", "Updated bio")).status, 200);
     assert.equal((await details()).bio, "Updated bio");
+    assert.equal((await editProfile(user.id, "changePronouns", "they/them")).status, 200);
+    assert.equal((await details()).pronouns, "they/them");
+    assert.equal((await list("q=renamed")).users[0].pronouns, "they/them");
+    assert.equal((await editProfile(user.id, "changePronouns", "")).status, 200);
+    assert.equal((await details()).pronouns, "");
     assert.equal((await editProfile(user.id, "clearBio")).status, 200);
     assert.equal((await editProfile(user.id, "clearAvatar")).status, 200);
     assert.equal((await editProfile(user.id, "clearBanner")).status, 200);
@@ -466,6 +495,7 @@ test("staff sessions can read admin data and role changes take effect on the nex
     })), [{ actorId: developmentAdmin.id, targetId: quote.id, targetHandle: "ytest" }]);
     assert.ok(entries.some(entry => entry.action === "clearAvatar" && entry.targetId === user.id));
     assert.ok(entries.some(entry => entry.action === "changeBio" && entry.targetId === user.id && entry.detail === null));
+    assert.ok(entries.some(entry => entry.action === "changePronouns" && entry.targetId === user.id && entry.detail === null));
     assert.equal(entries.filter(entry => entry.action === "removeGif" && entry.targetId === quote.id).length, 1);
     assert.equal(entries.filter(entry => entry.action === "removeVoice" && entry.targetId === reply.id).length, 1);
     assert.equal(entries.filter(entry => entry.action === "clearAttachments" && entry.targetId === reply.id).length, 1);

@@ -48,6 +48,7 @@ export const users = pgTable(
     handle: text().notNull().unique("users_handle_unique"),
     displayName: text("display_name").notNull().default(""),
     bio: text().notNull().default(""),
+    pronouns: text().notNull().default(""),
     notificationPromptDismissed: boolean("notification_prompt_dismissed").notNull().default(false),
     avatarKey: text("avatar_key"),
     identityAvatarHidden: boolean("identity_avatar_hidden").notNull().default(false),

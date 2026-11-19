@@ -47,6 +47,7 @@ import { extractTopics } from "./topics-text.ts";
 import { affectedPostIds, publishLiveChange, publishLivePost } from "./live-events.ts";
 
 import { syncMentions } from "./mentions.ts";
+import { attachSelfReplies } from "./self-replies.ts";
 import { readGifSelection } from "./storage/klipy.ts";
 import { pollDefinitionSchema } from "./poll-schema.ts";
 import { flushMediaDeletions } from "./storage/media-lifecycle.ts";
@@ -331,10 +332,13 @@ const listPosts: import("express").RequestHandler = async (req, res) => {
   const ancestors = topic ? await loadAncestors(page, viewerId) : undefined;
   res.json({
     repostedBy: {},
-    posts: page.map((row) =>
-      ancestors
-        ? { ...serializePost(row), ancestors: ancestors.get(row.id) ?? [] }
-        : serializePost(row),
+    posts: (
+      await attachSelfReplies(
+        page.map((row) => serializePost(row)),
+        viewerId,
+      )
+    ).map((post) =>
+      ancestors ? { ...post, ancestors: ancestors.get(post.id) ?? [] } : post,
     ),
     nextCursor:
       rows.length > 20 && last

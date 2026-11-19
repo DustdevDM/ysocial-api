@@ -166,6 +166,7 @@ export const posts = pgTable(
       table.id.desc(),
     ),
     index("posts_feed_idx").on(table.createdAt.desc(), table.id.desc()),
+    index("posts_content_search_idx").using("gin", sql`to_tsvector('simple', ${table.content})`),
     check(
       "posts_content_check",
       sql`char_length(${table.content}) <= 2000 AND (${table.content} ~ '[^[:space:]]' OR (${table.content} = '' AND (${table.gif} IS NOT NULL OR ${table.poll} IS NOT NULL OR ${table.voice} IS NOT NULL)))`,

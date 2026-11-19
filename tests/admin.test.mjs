@@ -188,6 +188,47 @@ test("staff sessions can read admin data and role changes take effect on the nex
     assert.equal(second.hasNextPage, false);
     assert.ok(first.users.every((row) => row.canEditRole && row.id !== second.users[0].id));
     const ids = [user.id, second.users[0].id];
+    const badgePath = base + "/api/admin/users/" + user.id + "/badges";
+    const changeBadge = (change, cookie = staffHeaders) => fetch(badgePath, {
+      method: "PATCH",
+      headers: { ...cookie, Origin: env.ADMIN_ORIGIN, "Content-Type": "application/json" },
+      body: JSON.stringify(change),
+    });
+    const publicBadgeProfile = async (handle) => {
+      const response = await fetch(base + "/api/profiles/" + handle);
+      assert.equal(response.status, 200);
+      return (await response.json()).profile;
+    };
+    assert.equal((await publicBadgeProfile("ytest")).isAdmin, true);
+    const optionsResponse = await fetch(base + "/api/admin/badge-options", { headers: staffHeaders });
+    assert.equal(optionsResponse.status, 200);
+    const options = await optionsResponse.json();
+    assert.ok(options.presets.every(({ icon }) => options.icons.includes(icon)));
+    assert.ok(options.icons.includes("bike"));
+    const icon = await fetch(base + "/api/profiles/badge-icons/bike");
+    assert.equal(icon.status, 200);
+    assert.match(icon.headers.get("content-type"), /^image\/svg\+xml/);
+    assert.match(await icon.text(), /lucide-bike/);
+
+    const add = { action: "add", icon: "bike", tooltip: "Organized a group ride" };
+    assert.equal((await changeBadge(add, headers)).status, 403);
+    assert.equal((await changeBadge({ ...add, icon: "unknown-icon" })).status, 400);
+    assert.equal((await changeBadge({ ...add, tooltip: " " })).status, 400);
+    const assigned = await changeBadge(add);
+    assert.equal(assigned.status, 200);
+    const { badges: [badge] } = await assigned.json();
+    assert.equal(badge.tooltip, add.tooltip);
+    assert.equal(badge.icon, add.icon);
+    assert.deepEqual((await changeBadge(add).then(response => response.json())).badges, [badge]);
+    const decorated = await publicBadgeProfile("staff_test");
+    assert.equal(decorated.isAdmin, false);
+    assert.equal(decorated.isOg, true);
+    assert.deepEqual(decorated.badges, [badge]);
+    assert.deepEqual((await list("q=staff_test")).users[0].badges, [badge]);
+    const removed = await changeBadge({ action: "remove", id: badge.id });
+    assert.equal(removed.status, 200);
+    assert.deepEqual((await publicBadgeProfile("staff_test")).badges, []);
+
     assert.equal((await update(ids, "moderator", staffHeaders, "https://other.invalid")).status, 403);
     assert.equal((await update(ids, "unknown")).status, 400);
     assert.equal((await update([...ids, randomUUID()], "moderator")).status, 404);

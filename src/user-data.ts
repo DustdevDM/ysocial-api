@@ -1,5 +1,11 @@
-import { getTableName, sql, type SQLWrapper, type Table } from "drizzle-orm";
-import { authIdentities, userFollows, users } from "./db/schema.ts";
+import {
+  getTableName,
+  type SQL,
+  sql,
+  type SQLWrapper,
+  type Table,
+} from "drizzle-orm";
+import { authIdentities, userFollows, paints, users } from "./db/schema.ts";
 
 type AvatarUserTable = Table & {
   id: { name: string };
@@ -9,7 +15,21 @@ type AvatarUserTable = Table & {
 
 export function avatarUrlSelection(user: AvatarUserTable) {
   // Preserve the outer table reference in Drizzle's single-table selections.
-  return sql<string | null>`coalesce('/api/' || ${user.avatarKey}, case when not ${user.identityAvatarHidden} then (select ${authIdentities.picture} from ${authIdentities} where ${authIdentities.userId} = ${sql.identifier(getTableName(user))}.${sql.identifier(user.id.name)} and ${authIdentities.deletedAt} is null) end)`;
+  return sql<
+    string | null
+  >`coalesce('/api/' || ${user.avatarKey}, case when not ${user.identityAvatarHidden} then (select ${authIdentities.picture} from ${authIdentities} where ${authIdentities.userId} = ${sql.identifier(getTableName(user))}.${sql.identifier(user.id.name)} and ${authIdentities.deletedAt} is null) end)`;
+}
+import type { PaintDefinition } from "./paint-schema.ts";
+
+export type UserPaint = {
+  id: string;
+  name: string;
+  definition: PaintDefinition;
+};
+
+export function paintJson(paintId: SQL) {
+  const column = (name: string) => sql`p.${sql.identifier(name)}`;
+  return sql<UserPaint | null>`(select jsonb_build_object('id', ${column(paints.id.name)}, 'name', ${column(paints.name.name)}, 'definition', ${column(paints.definition.name)}) from ${paints} p where ${column(paints.id.name)} = ${paintId})`;
 }
 
 export const userSelection = {
@@ -21,13 +41,17 @@ export const userSelection = {
 
 export const banDetailsSelection = {
   bannedAt: users.bannedAt,
-  banReason: sql<string | null>`case when ${users.bannedAt} is not null then coalesce(${users.banReason}, 'No reason provided.') end`,
+  banReason: sql<
+    string | null
+  >`case when ${users.bannedAt} is not null then coalesce(${users.banReason}, 'No reason provided.') end`,
   bannedBy: sql<string | null>`case when ${users.bannedAt} is not null then (
     select '@' || a.actor_handle from moderation_activity a
     where a.target_id = users.id and a.action = 'banUser'
     order by a.created_at desc, a.id desc limit 1
   ) end`,
-  bannedByProfileHandle: sql<string | null>`case when ${users.bannedAt} is not null then (
+  bannedByProfileHandle: sql<
+    string | null
+  >`case when ${users.bannedAt} is not null then (
     select actor.handle from moderation_activity a
     left join users actor on actor.id = a.actor_id
     where a.target_id = users.id and a.action = 'banUser'
@@ -39,7 +63,10 @@ export const publicProfileSelection = {
   bio: users.bio,
   pronouns: users.pronouns,
   bannerCrop: users.bannerCrop,
-  bannerUrl: sql<string | null>`case when ${users.bannerKey} is null then ${users.bannerExternalUrl} else '/api/' || ${users.bannerKey} end`,
+  bannerUrl: sql<
+    string | null
+  >`case when ${users.bannerKey} is null then ${users.bannerExternalUrl} else '/api/' || ${users.bannerKey} end`,
   followerCount: sql<number>`(select count(*)::int from ${userFollows} where ${userFollows.followingId} = ${users.id})`,
   followingCount: sql<number>`(select count(*)::int from ${userFollows} where ${userFollows.followerId} = ${users.id})`,
+  paint: paintJson(sql`${users}.${sql.identifier(users.paintId.name)}`),
 };
